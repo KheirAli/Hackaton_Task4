@@ -54,16 +54,21 @@ the selector itself uses about 0.2 s of CPU for the 30 sample commits):
 | --- | ---: | ---: |
 | every test, 3 workers (starter) | 1,614.1 s | 0 |
 | every test, best worker count | 1,104.5 s | 0 |
-| this selector | 214.4 s | 0 |
-| this selector with `BLAST_CLASS_NARROWING=1` | 179.7 s | 0 |
+| this selector, class narrowing off (`BLAST_CLASS_NARROWING=0`) | 214.4 s | 0 |
+| this selector (default) | 179.7 s | 0 |
 
-Class narrowing is off by default until it has been checked on more self-made mutants.
+Checked on our own mutated commits (one-line edits, labelled by running the full suite on each):
 
-On 240 of our own mutated commits (random one-line edits: 180 code, 30 fixture, 30 test;
-labelled by running the full suite on each) the shipped index misses none, with class
-narrowing off (12.5 s per commit) or on (10.0 s per commit). The first version of the tracer
-did miss one: CPython reports no line event for a function's own first line, so one-line
-lambdas looked unused. The tracer now records function entry as well.
+| Mutant set | Commits | Break something | Misses | Mean cost, narrowing off / on |
+| --- | ---: | ---: | ---: | --- |
+| random: 180 code, 30 fixture, 30 test | 240 | 183 | 0 | 12.5 s / 10.0 s |
+| class-body statements only | 200 | 126 | 0 | 26.7 s / 13.1 s |
+
+Two things the mutants caught. The first tracer missed one commit: CPython reports no line
+event for a function's own first line, so one-line lambdas looked unused; the tracer now
+records function entry as well. And six labels in the second set were wrong: the 28 s
+`test_max_nodes` failed under machine load during labelling and passes when re-run alone on
+those patches, so those labels were corrected.
 
 ## Reproduce
 

@@ -106,6 +106,90 @@ def _install():
                 frame = frame.f_back
         opens.add(rel)
 
+    # ---- optional comparison profile (BLAST_TRACE_CMP=1) -------------------
+    # Every single-operator comparison inside a function of sqlglot/ is routed
+    # through a probe that also evaluates the other comparison operators on
+    # the same operands. Per site we keep which alternatives EVER gave a
+    # different outcome in this process. If `a is b` and `a == b` agreed every
+    # time a test reached the site, swapping one for the other cannot change
+    # what that test does.
+    cmp_sites, cmp_state = [], {}
+    if os.environ.get("BLAST_TRACE_CMP") == "1":
+        import ast
+        import builtins
+        import importlib.machinery
+        import operator
+
+        names = ["Is", "IsNot", "Eq", "NotEq", "Lt", "LtE", "Gt", "GtE"]
+        funcs = [operator.is_, operator.is_not, operator.eq, operator.ne,
+                 operator.lt, operator.le, operator.gt, operator.ge]
+        full = (1 << len(funcs)) - 1
+
+        def probe(site, own, left, right):
+            state = cmp_state.get(site, 0)
+            try:
+                result = funcs[own](left, right)
+            except BaseException:
+                cmp_state[site] = full
+                raise
+            if state != full:
+                if result is True or result is False:
+                    for other in range(len(funcs)):
+                        bit = 1 << other
+                        if other == own or state & bit:
+                            continue
+                        try:
+                            if funcs[other](left, right) is not result:
+                                state |= bit
+                        except Exception:
+                            state |= bit
+                else:
+                    state = full
+                cmp_state[site] = state
+            return result
+
+        builtins.__blast_cmp__ = probe
+
+        class Rewriter(ast.NodeTransformer):
+            def __init__(self, rel):
+                self.rel, self.depth = rel, 0
+
+            def _function(self, node):
+                self.depth += 1
+                self.generic_visit(node)
+                self.depth -= 1
+                return node
+
+            visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _function
+
+            def visit_Compare(self, node):
+                key = (self.rel, node.lineno, node.col_offset)
+                self.generic_visit(node)
+                kind = type(node.ops[0]).__name__ if len(node.ops) == 1 else None
+                if not self.depth or kind not in names:
+                    return node
+                cmp_sites.append(key)
+                call = ast.Call(
+                    func=ast.Name(id="__blast_cmp__", ctx=ast.Load()),
+                    args=[ast.Constant(len(cmp_sites) - 1), ast.Constant(names.index(kind)),
+                          node.left, node.comparators[0]],
+                    keywords=[],
+                )
+                return ast.copy_location(call, node)
+
+        plain_get_code = importlib.machinery.SourceFileLoader.get_code
+        package = root + "sqlglot" + os.sep
+
+        def get_code(self, fullname):
+            path = self.get_filename(fullname)
+            if path.startswith(package) and path.endswith(".py"):
+                tree = ast.parse(self.get_data(path), path)
+                tree = ast.fix_missing_locations(Rewriter(path[len(root):]).visit(tree))
+                return compile(tree, path, "exec", dont_inherit=True)
+            return plain_get_code(self, fullname)
+
+        importlib.machinery.SourceFileLoader.get_code = get_code
+
     def dump():
         out = {"imp": {}, "fn": {}, "opens": sorted(opens)}
         classes = set()
@@ -116,6 +200,12 @@ def _install():
                 if path.startswith(root) and "<locals>" not in klass.__qualname__:
                     classes.add(path[len(root):] + ":" + klass.__qualname__)
         out["classes"] = sorted(classes)
+        if cmp_sites:
+            sites = {}
+            for site, state in list(cmp_state.items()):
+                rel, line, col = cmp_sites[site]
+                sites.setdefault(rel, {})["%d:%d" % (line, col)] = state
+            out["cmp"] = sites
         for key, source in (("imp", imp), ("fn", fn)):
             for name, line in list(source):
                 out[key].setdefault(name, []).append(line)

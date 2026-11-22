@@ -6,6 +6,7 @@
 
 KINDS is a comma list from: code, class, fixture, test (default "code").
 "class" restricts code edits to statements that sit directly in a class body.
+"cmp" swaps the operator of a comparison inside a function for another one.
 Each mutant is one small edit of the pinned checkout. `label` applies it to a
 private copy, runs the whole suite the way the organisers describe, and records
 which catalog tests fail. The result has the layout of the official sample, so
@@ -63,9 +64,47 @@ def gen(root, out, count, seed, kinds):
                 for stmt in node.body:
                     if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                         weighted["class"].extend((name, i) for i in range(stmt.lineno - 1, stmt.end_lineno))
+    # "cmp": swap the operator of a single-operator comparison inside a function.
+    cmp_ops = {"Is": "is", "IsNot": "is not", "Eq": "==", "NotEq": "!=", "Lt": "<", "LtE": "<=", "Gt": ">", "GtE": ">="}
+    cmp_sites = []
+    funcs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+    def find_cmp(node, name, inside):
+        if inside and isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]).__name__ in cmp_ops:
+            left, right = node.left, node.comparators[0]
+            if left.end_lineno == right.lineno:
+                cmp_sites.append((name, left.end_lineno - 1, left.end_col_offset, right.col_offset,
+                                  type(node.ops[0]).__name__))
+        for child in ast.iter_child_nodes(node):
+            find_cmp(child, name, inside or isinstance(node, funcs))
+
+    if "cmp" in kinds:
+        for name in pools["code"]:
+            find_cmp(ast.parse("\n".join(lines_of[name])), name, False)
     made, kinds_meta = 0, {}
     while made < count:
         kind = kinds[made % len(kinds)]
+        if kind == "cmp":
+            name, i, start, end, op = rng.choice(cmp_sites)
+            text = lines_of[name][i]
+            raw_bytes = text.encode("utf-8")
+            new_op = rng.choice([o for o in cmp_ops if o != op])
+            gap = raw_bytes[start:end].decode("utf-8")
+            if gap.strip() != cmp_ops[op]:
+                continue
+            new_line = raw_bytes[:start].decode("utf-8") + " " + cmp_ops[new_op] + " " + raw_bytes[end:].decode("utf-8")
+            old = lines_of[name]
+            new = old[:i] + [new_line] + old[i + 1:]
+            diff = "".join(difflib.unified_diff(
+                [l + "\n" for l in old[:-1]] + ([old[-1]] if old[-1] else []),
+                [l + "\n" for l in new[:-1]] + ([new[-1]] if new[-1] else []),
+                "a/" + name, "b/" + name, n=3))
+            cid = "mq%04d" % (made + seed * 10000)
+            with open(os.path.join(out, "commits", cid + ".patch"), "w", encoding="utf-8") as handle:
+                handle.write("diff --git a/%s b/%s\n" % (name, name) + diff)
+            kinds_meta[cid] = {"kind": kind, "file": name, "line": i + 1, "op": op + ">" + new_op}
+            made += 1
+            continue
         name, i = rng.choice(weighted[kind])
         old = lines_of[name]
         line = old[i]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Turn per-test traces of the CLEAN pinned checkout into the runtime index.
 
-Usage: build_index.py SQLGLOT_ROOT TESTS_JSON RAW_DIR[,RAW_DIR...] OUT_ZIP [CLASS_INFO_JSON]
+Usage: build_index.py SQLGLOT_ROOT TESTS_JSON RAW_DIR[,RAW_DIR...] OUT_ZIP [CLASS_INFO_JSON [CMP_RAW_DIR]]
 
 Several RAW_DIRs (independent trace runs, e.g. different hash seeds) are unioned.
 
@@ -24,6 +24,8 @@ import zipfile
 
 root, tests_json, raw, out_zip = sys.argv[1:5]
 class_info = sys.argv[5] if len(sys.argv) > 5 else None
+cmp_raw = sys.argv[6] if len(sys.argv) > 6 else None
+CMP_OPS = ["Is", "IsNot", "Eq", "NotEq", "Lt", "LtE", "Gt", "GtE"]
 root = os.path.realpath(root)
 tests = json.load(open(tests_json))["tests"]
 ids = [t["id"] for t in tests]
@@ -112,6 +114,33 @@ def class_users():
 
 classes = class_users()
 
+
+def comparison_profile():
+    """Per file and comparison site "line:col": tests that reached the site in the
+    comparison-profile run ("x") and, per alternative operator, the tests for which
+    that operator ever gave a different outcome than the one in the source ("d")."""
+    if not cmp_raw:
+        return {}
+    out = {}
+    for bit, test in enumerate(tests):
+        rec = json.load(open(os.path.join(cmp_raw, f"{test['number']}.json")))
+        if rec["outcome"] != "passed":
+            continue  # no profile for this test: it stays in the plain line-coverage set
+        mask = 1 << bit
+        for name, sites in rec.get("cmp", {}).items():
+            per = out.setdefault(name, {})
+            for site, state in sites.items():
+                entry = per.setdefault(site, [0, [0] * len(CMP_OPS)])
+                entry[0] |= mask
+                for i in range(len(CMP_OPS)):
+                    if state >> i & 1:
+                        entry[1][i] |= mask
+    return {name: {site: {"x": format(e[0], "x"), "d": {CMP_OPS[i]: format(m, "x") for i, m in enumerate(e[1]) if m}}
+                   for site, e in sites.items()} for name, sites in out.items()}
+
+
+comparisons = comparison_profile()
+
 with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     def put(name, data):
         info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
@@ -140,6 +169,7 @@ with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
             "sets": sets,
             "lines": lines,
             "classes": classes.get(name, []),
+            "cmp": comparisons.get(name, {}),
         }, separators=(",", ":")))
     for name in base_files:
         if name.endswith(".py") and (name.startswith("sqlglot/") or name.startswith("tests/")):

@@ -58,6 +58,10 @@ def run(test):
         for key in ("imp", "fn"):
             for name, lines in data[key].items():
                 record[key].setdefault(name, set()).update(lines)
+        for name, sites in data.get("cmp", {}).items():
+            mine = record.setdefault("cmp", {}).setdefault(name, {})
+            for site, state in sites.items():
+                mine[site] = mine.get(site, 0) | state
         os.remove(part)
     record["opens"] = sorted(opens)
     record["classes"] = sorted(classes)
@@ -84,6 +88,10 @@ for part in sorted(glob.glob(os.path.join(raw, "part*.*.json"))):
     for key in ("imp", "fn"):
         for name, lines in data[key].items():
             record[key][name] = sorted(set(record[key].get(name, ())) | set(lines))
+    for name, sites in data.get("cmp", {}).items():
+        mine = record.setdefault("cmp", {}).setdefault(name, {})
+        for site, state in sites.items():
+            mine[site] = mine.get(site, 0) | state
     json.dump(record, open(target, "w"), separators=(",", ":"))
     os.remove(part)
     print("merged late part for test", number, file=sys.stderr)

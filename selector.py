@@ -33,7 +33,8 @@ from pathlib import Path
 DATA = Path(os.environ.get("BLAST_DATA", "/data"))
 INDEX = Path(os.environ.get("BLAST_INDEX", Path(__file__).resolve().parent / "blast_index.zip"))
 DEBUG = os.environ.get("BLAST_DEBUG") == "1"
-CLASS_NARROWING = os.environ.get("BLAST_CLASS_NARROWING", "0") == "1"
+CLASS_NARROWING = os.environ.get("BLAST_CLASS_NARROWING", "1") == "1"
+CMP_PROFILE = os.environ.get("BLAST_CMP_PROFILE", "1") == "1"
 EAGER_SHARE = float(os.environ.get("BLAST_EAGER_SHARE", "0.9"))
 MAX_WORKERS = 8
 WORKER_OVERHEAD_MS = 2000
@@ -78,9 +79,10 @@ class Index:
                     "implines": raw["implines"],
                     "lines": {int(k): sets[v] for k, v in raw["lines"].items()},
                     "classes": [(lo, hi, int(m, 16)) for lo, hi, m in raw.get("classes", ())],
+                    "cmp": raw.get("cmp", {}),
                 }
             else:
-                entry = {"importers": 0, "implines": [], "lines": {}, "classes": []}
+                entry = {"importers": 0, "implines": [], "lines": {}, "classes": [], "cmp": {}}
             self._cov[name] = entry
         return self._cov[name]
 
@@ -311,7 +313,8 @@ def _touches(node, ranges):
 
 
 def diff_trees(old, new, old_ranges, new_ranges):
-    """Regions of the OLD tree that differ: list of (kind, lo, hi), kind 'fn' or 'imp'."""
+    """Regions of the OLD tree that differ: (kind, lo, hi) with kind 'fn' or 'imp',
+    or ('cmp', lo, hi, "line:col", NewOperatorName) for an operator-only comparison edit."""
     regions = []
 
     def report(node, fn, stmt):
@@ -391,6 +394,20 @@ def diff_trees(old, new, old_ranges, new_ranges):
                 regions.append(("fn",) + _span(a))
             walk_list(a.body, b.body, a, None, a)
             return
+        if (
+            isinstance(a, ast.Compare)
+            and fn is not None
+            and len(a.ops) == 1 == len(b.ops)
+            and type(a.ops[0]) is not type(b.ops[0])
+            and _dump(a.left) == _dump(b.left)
+            and _dump(a.comparators) == _dump(b.comparators)
+        ):
+            # Only the comparison operator changed: remember the site so the
+            # comparison profile can drop tests for which both operators agree.
+            report(a, fn, stmt)
+            kind, lo, hi = regions.pop()
+            regions.append(("cmp", lo, hi, "%d:%d" % (a.lineno, a.col_offset), type(b.ops[0]).__name__))
+            return
         if isinstance(a, ast.Lambda):
             if _dump(a.args) != _dump(b.args):
                 regions.append(("fn",) + _span(a))
@@ -431,9 +448,18 @@ def select_python(index, name, change):
         return index.touchers(name)
     regions = diff_trees(index.tree(name), new_tree, old_ranges, new_ranges)
     mask = index.openers(name)  # tests that read this source as text see any edit
-    for kind, lo, hi in regions:
+    for kind, lo, hi, *site in regions:
         if kind == "fn":
             part = index.fn_range(name, lo, hi)
+        elif kind == "cmp":
+            part = index.fn_range(name, lo, hi)
+            profile = index.cov(name)["cmp"].get(site[0]) if CMP_PROFILE else None
+            if profile is not None:
+                # Tests that reached the site keep it only if the new operator ever
+                # disagreed with the old one on their operands. Tests that ran the
+                # line but have no profile for the site are kept.
+                differs = int(profile["d"].get(site[1], "0"), 16)
+                part = differs | (part & ~int(profile["x"], 16))
         else:
             part = index.imp_range(name, lo, hi) | index.fn_range(name, lo, hi)
         log("   %s %d-%s -> %d tests" % (kind, lo, hi if hi < 10**9 else "end", bin(part).count("1")))
