@@ -123,7 +123,8 @@ def comparison_profile():
         return {}
     out = {}
     for bit, test in enumerate(tests):
-        rec = json.load(open(os.path.join(cmp_raw, f"{test['number']}.json")))
+        path = os.path.join(cmp_raw, f"{test['number']}.json")
+        rec = json.load(open(path)) if os.path.exists(path) else {"outcome": "missing"}
         if rec["outcome"] != "passed":
             continue  # no profile for this test: it stays in the plain line-coverage set
         mask = 1 << bit
