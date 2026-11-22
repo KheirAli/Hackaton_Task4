@@ -34,7 +34,7 @@ DATA = Path(os.environ.get("BLAST_DATA", "/data"))
 INDEX = Path(os.environ.get("BLAST_INDEX", Path(__file__).resolve().parent / "blast_index.zip"))
 DEBUG = os.environ.get("BLAST_DEBUG") == "1"
 CLASS_NARROWING = os.environ.get("BLAST_CLASS_NARROWING", "1") == "1"
-CONST_NARROWING = os.environ.get("BLAST_CONST_NARROWING", "1") == "1"
+CONST_NARROWING = os.environ.get("BLAST_CONST_NARROWING", "0") == "1"
 CMP_PROFILE = os.environ.get("BLAST_CMP_PROFILE", "1") == "1"
 # Operator swaps whose outcome on given operands is stable from run to run: identity
 # against equality, and a strict bound against its inclusive form (they differ only

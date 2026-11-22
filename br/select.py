@@ -17,7 +17,7 @@ import re
 import sys
 import time
 
-from br import adapters, classify, cmptypes, diffparse, entrymaps, maps, pack, slices
+from br import adapters, classify, cmptypes, diffparse, entrymaps, maps, pack, slices, speed
 
 ROOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
 MAPS = os.environ.get("BR_MAPS", "/app/maps")
@@ -72,6 +72,8 @@ ADD_NOOP = os.environ.get("BR_ADD_NOOP", "1") == "1"                  # unused m
 RUNNER_FILES = {"conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "usercustomize.py", ".coveragerc"}
 PYTEST_KEYS = {"addopts", "filterwarnings", "testpaths", "python_files", "python_classes", "python_functions",
                "markers", "xfail_strict", "timeout", "norecursedirs", "required_plugins", "pythonpath"}
+WALL_FACTOR = float(os.environ.get("BR_WALL_FACTOR", "6"))            # child wall limit = factor * estimate + slack
+WALL_SLACK = float(os.environ.get("BR_WALL_SLACK", "8"))
 ISEQ = os.environ.get("BR_ISEQ", "1") == "1"                          # prove is/== swaps equivalent from operand types
 NEED_3P = ("tests/test_executor.py", "tests/test_optimizer.py")
 
@@ -987,8 +989,45 @@ def _sample(ctx, n, sel, full_cost):
         return None
 
 
+_EVIDENCE = None
+
+
+def _evidence_filter(ctx, text):
+    """Second, independent static analysis (br/evidence.py with its own map of the pinned commit).
+    Returns the test numbers it considers possibly affected, or None when it cannot bound the change."""
+    global _EVIDENCE
+    if os.environ.get("BR_EVIDENCE", "1") != "1":
+        return None
+    try:
+        from br import evidence
+        if _EVIDENCE is None:
+            index = evidence.Index(os.path.join(MAPS, "blast_index.zip"))
+            number_of = {tid: n for n, tid in enumerate(ctx.ids)} if isinstance(ctx.ids, list) else {tid: n for n, tid in ctx.ids.items()}
+            known = [number_of.get(tid) for tid in index.tests]
+            untraced = set(index.untraced)
+            always = {n for n, tid in (enumerate(ctx.ids) if isinstance(ctx.ids, list) else ctx.ids.items())
+                      if tid not in set(index.tests) or tid in untraced}
+            _EVIDENCE = (index, known, always)
+        index, known, always = _EVIDENCE
+        mask = evidence.select(index, text)
+    except Exception:
+        return None
+    out = set(always)
+    bit = 0
+    while mask:
+        if mask & 1 and known[bit] is not None:
+            out.add(known[bit])
+        mask >>= 1
+        bit += 1
+    return out
+
+
 def decide(ctx, commit, text, deadline):
     cand, certain, changes, notes, py_impact = analyze(ctx, text)
+    keep = _evidence_filter(ctx, text)
+    if keep is not None and not certain:
+        # Both analyses over-approximate the affected tests, so their intersection still does.
+        cand = set(cand) & keep
     impacts, data = ctx.last
     info = {"cand": len(cand), "notes": notes, "verified": 0, "cpu": 0.0, "how": ""}
     # Candidates were narrowed for these modules on the assumption that they still import. Check that
@@ -1086,9 +1125,12 @@ def decide(ctx, commit, text, deadline):
             best = j
     gain = static_cost - _cost(ctx, U)
     e = est(V)
-    too_much = (e > AUDIT_CAP) if AUDIT else (e > MAX_VERIFY_CPU or e > VERIFY_FACTOR * gain)
-    if (not VERIFY or not V or too_much or time.time() + e * 4 + 5 > deadline):
-        info["how"] = f"static (est {e:.1f}s vs gain {gain:.1f}s of {static_cost:.1f}s)"
+    # CPU spent here is charged at this machine's speed, not at the speed the estimate was made for.
+    pace = speed.factor()
+    real = e * pace
+    too_much = (e > AUDIT_CAP) if AUDIT else (real > MAX_VERIFY_CPU or real > VERIFY_FACTOR * gain)
+    if (not VERIFY or not V or too_much or time.time() + real * 4 + 5 > deadline):
+        info["how"] = f"static (est {e:.1f}s x{pace:.2f} vs gain {gain:.1f}s of {static_cost:.1f}s)"
         return cand | _probe_only(ctx, changes, deadline), info
 
     # Each sliced test gets its own fixture filter, switched on right before it runs. TestExecutor builds
@@ -1123,8 +1165,11 @@ def decide(ctx, commit, text, deadline):
     always = [ctx.ids[n] for n in order if ALWAYS and (ctx.ms[n] >= 1000 and vcost[n] < 0.7 * ctx.ms[n] / 1000)]
     if any(ctx.file_of[n] in NEED_3P for n in order):
         ver.ensure_preloaded(("duckdb", "pandas", "numpy"))
-    timeouts = {ctx.ids[n]: max(3.0, 8 * ctx.cpu[n]) for n in order}
-    wall = min(max(10.0, e * 12 + 10), max(1.0, deadline - time.time() - 3))
+    slow = max(1.0, pace)
+    timeouts = {ctx.ids[n]: max(3.0, 8 * ctx.cpu[n]) * slow for n in order}
+    # Wall limit for the child: a patch that makes a test hang burns CPU until this expires, and
+    # whatever was not verified by then is emitted as if it had not been run.
+    wall = min(max(10.0, e * WALL_FACTOR + WALL_SLACK) * slow, max(1.0, deadline - time.time() - 3))
 
     # Lazy table loading skips set-up work the selected tests do not need. That is only faithful when the
     # patch cannot break the set-up itself: nothing under tests/ changed, and the change is not in code that
@@ -1207,11 +1252,15 @@ def decide(ctx, commit, text, deadline):
         failed = {ctx.num[i] for i, o in results.items() if o != "pass" and i in ctx.num}
         passed = {ctx.num[i] for i, o in results.items() if o == "pass" and i in ctx.num}
         pending = set(order) - sampled - passed - failed
+        if res is not None and not failed and not broken and not pending and not sampled and not res.died:
+            # a complete, clean run: its CPU against our estimate says how fast this machine is
+            speed.observe(e, res.cpu_s)
         # Phase 1b: a failure stopped the run. Everything not yet verified would be emitted; keep verifying
         # (without stopping) when that costs clearly less CPU than emitting those tests would.
         if CONTINUE and failed and pending and not broken:
             rest = est(pending)
             saved = _cost(ctx, failed | pending | U) - _cost(ctx, failed | U)
+            rest *= speed.factor()
             if rest <= CONT_FACTOR * saved and rest <= MAX_VERIFY_CPU and time.time() + rest * 4 + 5 < deadline:
                 more = [i for i in ids if ctx.num[i] in pending]
                 res = go(more, more, False)
