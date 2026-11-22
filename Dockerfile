@@ -52,12 +52,7 @@ RUN STDLIB=$(python -c "import sysconfig; print(sysconfig.get_path('stdlib'))") 
 # CPU settings for the run (see the selector notes): a fixed hash seed (the saved base state of
 # the import fingerprint depends on it) and mimalloc with transparent huge pages (cheaper fork,
 # exit and page faults; no effect where the host has THP off).
-ENV PYTHONHASHSEED=0 \
-    PYTHONMALLOC=mimalloc \
-    MIMALLOC_LARGE_OS_PAGES=1 \
-    MIMALLOC_RESERVE_OS_MEMORY=256MiB \
-    MIMALLOC_ARENA_EAGER_COMMIT=1 \
-    MIMALLOC_PURGE_DELAY=-1
+ENV PYTHONHASHSEED=0
 
 # 4. our program and maps (last, so that a code change rebuilds only this). The TestExecutor row
 #    cache (preload.py) is built from the pinned csv files and checked against the real
