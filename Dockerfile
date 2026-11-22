@@ -15,5 +15,5 @@ COPY br /app/br
 COPY maps /app/maps
 RUN python -m compileall -q /app/br && chmod -R a+rX /app
 
-ENV BR_SAMPLE_TRUST=0 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app SKIP_INTEGRATION=0 BR_SQLGLOT=/opt/sqlglot BR_MAPS=/app/maps
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app SKIP_INTEGRATION=0 BR_SQLGLOT=/opt/sqlglot BR_MAPS=/app/maps
 CMD ["python", "-m", "br.main"]

@@ -987,45 +987,8 @@ def _sample(ctx, n, sel, full_cost):
         return None
 
 
-_EVIDENCE = None
-
-
-def _evidence_filter(ctx, text):
-    """Second, independent static analysis (br/evidence.py with its own map of the pinned commit).
-    Returns the test numbers it considers possibly affected, or None when it cannot bound the change."""
-    global _EVIDENCE
-    if os.environ.get("BR_EVIDENCE", "1") != "1":
-        return None
-    try:
-        from br import evidence
-        if _EVIDENCE is None:
-            index = evidence.Index(os.path.join(MAPS, "blast_index.zip"))
-            number_of = {tid: n for n, tid in enumerate(ctx.ids)} if isinstance(ctx.ids, list) else {tid: n for n, tid in ctx.ids.items()}
-            known = [number_of.get(tid) for tid in index.tests]
-            untraced = set(index.untraced)
-            always = {n for n, tid in (enumerate(ctx.ids) if isinstance(ctx.ids, list) else ctx.ids.items())
-                      if tid not in set(index.tests) or tid in untraced}
-            _EVIDENCE = (index, known, always)
-        index, known, always = _EVIDENCE
-        mask = evidence.select(index, text)
-    except Exception:
-        return None
-    out = set(always)
-    bit = 0
-    while mask:
-        if mask & 1 and known[bit] is not None:
-            out.add(known[bit])
-        mask >>= 1
-        bit += 1
-    return out
-
-
 def decide(ctx, commit, text, deadline):
     cand, certain, changes, notes, py_impact = analyze(ctx, text)
-    keep = _evidence_filter(ctx, text)
-    if keep is not None and not certain:
-        # Both analyses over-approximate the affected tests, so their intersection still does.
-        cand = set(cand) & keep
     impacts, data = ctx.last
     info = {"cand": len(cand), "notes": notes, "verified": 0, "cpu": 0.0, "how": ""}
     # Candidates were narrowed for these modules on the assumption that they still import. Check that
