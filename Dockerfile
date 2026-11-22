@@ -88,4 +88,4 @@ RUN (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
     && chmod -R a+rX /app
 
 WORKDIR /repo
-CMD ["python", "/app/main.py"]
+CMD ["python", "/app/guarded_main.py"]
