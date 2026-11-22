@@ -1,49 +1,121 @@
-# Blast Radius — safe first submission
+# Blast Radius — execution-evidence test selection
 
-This is a **complete self-contained submission** to [RWX Blast Radius](https://www.joinbuilders.org/buildathon/tracks/blast-radius), intended to check that your repository builds, runs, and scores correctly.
+Submission for [RWX Blast Radius](https://www.joinbuilders.org/buildathon/tracks/blast-radius).
+For every patch to sqlglot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` it prints which
+tests to run and how to spread them over at most 8 workers.
 
-- Selects **every** test for every commit (expected zero missed failures).
-- Schedules tests by longest-processing-time-first and chooses the best worker count 1–8, including two seconds per worker.
-- Uses no SQLGlot source, static maps, generated indexes, sample answers, network calls, or writes at runtime.
-- It is the tested **`all` baseline** that the user measured at **1104.510 simulated seconds** on the 30-commit sample (CPU time excluded). The official practice score includes CPU overhead and may differ.
+## How it decides
 
-## Quick local test without Docker
+Everything rests on one map of the **pinned commit only**, `blast_index.zip`, built by `tools/`.
+Each of the 1,620 catalog tests was run **alone, in a fresh process tree** (worker processes of
+`multiprocessing` pools and `python -c` children included) and we recorded:
+
+| Evidence | Meaning |
+| --- | --- |
+| function lines | lines the test ran inside functions and lambdas (call time) |
+| imports | files the test's processes imported, and the lines that ran at import time |
+| opened files | repository files it opened: SQL fixtures, CSV/JSON data, sources read as text |
+| used classes | classes on whose instances it ran a method (with their base classes) |
+
+A second pass records function lines per test while the whole suite shares one process, to
+catch tests that reach code only through state left by earlier tests. The two are unioned.
+
+At run time `selector.py` (standard library only) handles each changed file of a patch:
+
+* **Python file.** Apply the patch to the base text, parse both versions and compare the ASTs.
+  * Same AST (comments, blank lines, formatting): nothing can change. Tests that *read the
+    file as text* are still selected.
+  * Difference inside a function or lambda body: tests that ran the lines of the enclosing
+    statement. A changed signature selects the tests that ran the function. Added statements
+    select the tests that ran the enclosing function.
+  * Difference in module- or class-level code: every test that imported the file. sqlglot loads
+    dialects lazily, so this is usually a small set. For files that (nearly) every test imports
+    it would mean "run everything", so a change strictly inside one top-level class is narrowed
+    to the tests that *used* that class or mentioned it by name in a line they ran.
+  * A new version that does not parse: every test that touches the file.
+* **Any other file** (fixtures, data): the tests that opened it; if none did, the tests that
+  opened something in the same directory.
+* **Anything unexplained** — unknown files, new Python files, suite configuration, patches that
+  do not apply, internal errors — falls back to a wider set, in the end **every test**. Tests
+  the index has never seen are kept in every non-empty selection.
+
+Selected tests are packed with longest-first greedy scheduling for each worker count 1–8,
+keeping the cheapest under `max load + 2 s × workers`.
+
+No patch, kind of edit or answer is looked up anywhere; the selector never sees
+`sample/answers.json`.
+
+## Results
+
+Measured locally with the organisers' `score.py` (simulated seconds, CPU time not included;
+the selector itself uses about 0.2 s of CPU for the 30 sample commits):
+
+| Selector | 30-commit sample | Misses |
+| --- | ---: | ---: |
+| every test, 3 workers (starter) | 1,614.1 s | 0 |
+| every test, best worker count | 1,104.5 s | 0 |
+| this selector | 214.4 s | 0 |
+| this selector with `BLAST_CLASS_NARROWING=1` | 179.7 s | 0 |
+
+Class narrowing is off by default until it has been checked on more self-made mutants.
+On our own mutated commits (random one-line edits of code, fixtures and tests, labelled by
+running the full suite on each) the shipped configuration missed none of the first 102.
+
+## Reproduce
 
 ```bash
-cd blast-radius-submission
-python3 self_test.py
+python3 self_test.py                               # protocol, patch handling, fallbacks
 
-# The user has already extracted the official sample here:
-export DATA_DIR="$HOME/blast-official/sample"
-BLAST_DATA="$DATA_DIR" python3 selector.py > output.jsonl
-python3 check_output.py "$DATA_DIR/tests.json" "$DATA_DIR/commits" output.jsonl "$DATA_DIR/answers.json"
+export KIT=$HOME/blast-official                    # unpacked starter kit (score.py, sample/)
+BLAST_DATA=$KIT/sample python3 selector.py > output.jsonl
+python3 $KIT/score.py $KIT/sample $KIT/sample/answers.json output.jsonl
+BLAST_DEBUG=1 BLAST_DATA=$KIT/sample python3 selector.py 2>&1 >/dev/null | less   # reasons
 ```
 
-Expected: `PASS`, `Missed commits: 0`, with simulated score similar to 1104.510 s.
+Rebuilding the index (Python 3.13 with the packages of the kit's `requirements.lock`, a clean
+sqlglot checkout at the pinned commit; about 15 minutes on a large machine):
 
-## Github deployment without local Docker or sudo
+```bash
+python tools/trace_all.py  $SQLGLOT $KIT/sample/tests.json raw_a      # one fresh process tree per test
+python tools/trace_all.py  $SQLGLOT $KIT/sample/tests.json raw_b      # again: other hash seed
+(cd $SQLGLOT && SKIP_INTEGRATION=0 BLAST_TRACE_ROOT=$SQLGLOT BLAST_SUITE_RAW=$PWD/raw_suite \
+   BLAST_TESTS_JSON=$KIT/sample/tests.json PYTHONPATH=$SQLGLOT:/path/to/tools \
+   python -m pytest -p suite_trace -p no:cacheprovider tests)        # whole suite, one process
+python tools/class_info.py $SQLGLOT > class_info.json
+python tools/build_index.py $SQLGLOT $KIT/sample/tests.json raw_a,raw_b,raw_suite blast_index.zip class_info.json
+```
 
-1. Create a **new public and empty** GitHub repository (`blast-radius-submission`).
-2. From the unpacked folder, run `git init -b main`, `git add .`, `git commit -m "Verified safe baseline"`.
-3. Add your repository remote, then `git push -u origin main`.
-4. Open the **Actions** tab. The automatically triggered `Verify Blast Radius submission` workflow downloads the official 30-commit sample, builds the image using Docker on a GitHub runner, runs it with competition restrictions, and scores its output.
-5. If all checks pass, copy the exact SHA from `git rev-parse HEAD` and paste your public repository URL + SHA into the official [Blast Radius submission page](https://www.joinbuilders.org/buildathon/tracks/blast-radius).
-6. Confirm that the platform records a **valid scored** submission. A green GitHub Actions result alone does **not** mean you submitted to Builders.
+Checking for missed failures without the sample answers (this is how the rules above were
+validated):
 
-## File manifest
+```bash
+python tools/mutants.py gen   $SQLGLOT mut 240 1 code,code,code,class,fixture,test
+python tools/mutants.py label $SQLGLOT $KIT/sample/tests.json mut    # full pytest run per mutant
+BLAST_DATA=mut python3 selector.py > mut/out.jsonl
+python3 $KIT/score.py mut mut/answers.json mut/out.jsonl
+```
+
+## Files
 
 | File | Use |
-| ---- | --- |
-| `Dockerfile` | Required root-level competition image. Runs as unprivileged user. |
-| `selector.py` | Actual entry point; reads `/data/tests.json` and `/data/commits/*.patch`. |
-| `check_output.py` | Local output validator and approximate sample scorer; excludes CPU charge. |
-| `self_test.py` | Offline smoke test. |
-| `.github/workflows/verify.yml` | Docker + protocol integration test on GitHub's hosted runner. |
-| `.dockerignore`, `.gitignore` | Prevent sample answer files and outputs entering image/repository. |
+| --- | --- |
+| `Dockerfile` | The image the scorer builds: official base image, `selector.py`, `blast_index.zip`. No network needed beyond the base image. |
+| `selector.py` | Entry point. Reads `/data/tests.json` and `/data/commits/*.patch`, prints one JSON line per commit. |
+| `blast_index.zip` | Map of the pinned commit: coverage, imports, opened files, class users, base sources. |
+| `tools/tracer/sitecustomize.py` | Tracer loaded into every Python process of a traced test (`sys.monitoring`, audit hook). |
+| `tools/trace_all.py`, `tools/run_one.py` | Run every catalog test alone and collect its trace. |
+| `tools/suite_trace.py` | pytest plugin: per-test function lines with the suite in one process. |
+| `tools/class_info.py` | Lists classes whose construction the tracer can observe. |
+| `tools/build_index.py` | Turns traces into `blast_index.zip`. |
+| `tools/mutants.py`, `tools/blast_report.py` | Make and label our own mutated commits to measure misses. |
+| `self_test.py`, `check_output.py` | Offline tests and an output validator. |
+| `.github/workflows/verify.yml` | Builds the image on GitHub, runs it under the scorer's limits, scores it with the kit's `score.py`. |
 
-## Caveats
+## Known limits
 
-- All-tests is safe but not a winning test-selection strategy. Submit it first to confirm that packaging and official scoring work, then separately improve.
-- This package intentionally **does not include** your generated `coverage_index.json.gz`. It does not use the experimental coverage selector, which missed 4 sample commits.
-- The official server, not GitHub Actions, decides competition validity and scoring. All three server runs must be valid.
-- Don't accidentally commit official `answers.json`, test patches, or large data artifacts.
+* Coverage is evidence from the clean commit. A change that makes a test reach code it never
+  reached before, through data rather than through a line the test ran, can be missed.
+* The class narrowing is a heuristic: it assumes class-level data is read through instances of
+  the class or by naming it. It is only applied to files that nearly every test imports.
+* Tests that take 20–30 s (`test_max_nodes`, `test_execute_tpcds`) cover much of the core, so
+  commits that touch widely used code still cost about 25 s.
