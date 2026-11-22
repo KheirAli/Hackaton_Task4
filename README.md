@@ -1,130 +1,70 @@
-# Blast Radius — execution-evidence test selection
+# Blast Radius starter
 
-Submission for [RWX Blast Radius](https://www.joinbuilders.org/buildathon/tracks/blast-radius).
-For every patch to sqlglot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa` it prints which
-tests to run and how to spread them over at most 8 workers.
+A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
 
-## How it decides
+## The problem
 
-Everything rests on one map of the **pinned commit only**, `blast_index.zip`, built by `tools/`.
-Each of the 1,620 catalog tests was run **alone, in a fresh process tree** (worker processes of
-`multiprocessing` pools and `python -c` children included) and we recorded:
+Your image gets a batch of code changes to [sqlglot](https://github.com/tobymao/sqlglot) at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. For each change, print which tests to run and how to split them across up to 8 workers.
 
-| Evidence | Meaning |
+| | |
 | --- | --- |
-| function lines | lines the test ran inside functions and lambdas (call time) |
-| imports | files the test's processes imported, and the lines that ran at import time |
-| opened files | repository files it opened: SQL fixtures, CSV/JSON data, sources read as text |
-| used classes | classes on whose instances it ran a method (with their base classes) |
+| `/data/commits/<id>.patch` | One unified diff against the pinned commit. Each stands alone: none builds on another. |
+| `/data/tests.json` | Every test, numbered, with its file and the seconds it took us to run. |
+| stdout | One JSON line a commit: `{"commit": "k7q2", "workers": [[12, 845, 901], [3, 77]]}` |
 
-A second pass records function lines per test while the whole suite shares one process, to
-catch tests that reach code only through state left by earlier tests. The two are unioned.
+Each inner list is one worker's test numbers. `"workers": []` runs nothing, which is the right answer for a change that breaks nothing.
 
-At run time `selector.py` (standard library only) handles each changed file of a patch:
+## Scoring
 
-* **Python file.** Apply the patch to the base text, parse both versions and compare the ASTs.
-  * Same AST (comments, blank lines, formatting): nothing can change. Tests that *read the
-    file as text* are still selected.
-  * Difference inside a function or lambda body: tests that ran the lines of the enclosing
-    statement. A changed signature selects the tests that ran the function. Added statements
-    select the tests that ran the enclosing function.
-  * Difference in module- or class-level code: every test that imported the file. sqlglot loads
-    dialects lazily, so this is usually a small set. For files that (nearly) every test imports
-    it would mean "run everything", so a change strictly inside one top-level class is narrowed
-    to the tests that *used* that class or mentioned it by name in a line they ran.
-  * A new version that does not parse: every test that touches the file.
-* **Any other file** (fixtures, data): the tests that opened it; if none did, the tests that
-  opened something in the same directory.
-* **Anything unexplained** — unknown files, new Python files, suite configuration, patches that
-  do not apply, internal errors — falls back to a wider set, in the end **every test**. Tests
-  the index has never seen are kept in every non-empty selection.
+Lower is better. [SCORING.md](SCORING.md) has the exact rules; in short:
 
-Selected tests are packed with longest-first greedy scheduling for each worker count 1–8,
-keeping the cheapest under `max load + 2 s × workers`.
+- A commit costs the recorded seconds of its busiest worker, plus 2 seconds for every worker.
+- A commit where you left out a test that fails adds 300 seconds.
+- The CPU seconds your program uses are added. Running sqlglot's tests while you decide is allowed, and you pay for the time.
+- Your image runs 3 times and the middle total counts.
 
-No patch, kind of edit or answer is looked up anywhere; the selector never sees
-`sample/answers.json`.
+"Fails" means pytest reports a failure, an error or a timeout for the test, or the test's file cannot be imported. A test with subtests is one test: one failing subtest fails it.
 
-## Results
+## Try it
 
-Measured locally with the organisers' `score.py` (simulated seconds, CPU time not included;
-the selector itself uses about 0.2 s of CPU for the 30 sample commits):
+You need Docker, make and Python 3.9 or newer. The kit unpacks into the folder you are in, so unpack it into an empty one.
 
-| Selector | 30-commit sample | Misses |
-| --- | ---: | ---: |
-| every test, 3 workers (starter) | 1,614.1 s | 0 |
-| every test, best worker count | 1,104.5 s | 0 |
-| this selector, class narrowing off (`BLAST_CLASS_NARROWING=0`) | 214.4 s | 0 |
-| this selector (default) | 179.7 s | 0 |
-
-Checked on our own mutated commits (one-line edits, labelled by running the full suite on each):
-
-| Mutant set | Commits | Break something | Misses | Mean cost, narrowing off / on |
-| --- | ---: | ---: | ---: | --- |
-| random: 180 code, 30 fixture, 30 test | 240 | 183 | 0 | 12.5 s / 10.0 s |
-| class-body statements only | 200 | 126 | 0 | 26.7 s / 13.1 s |
-
-Two things the mutants caught. The first tracer missed one commit: CPython reports no line
-event for a function's own first line, so one-line lambdas looked unused; the tracer now
-records function entry as well. And six labels in the second set were wrong: the 28 s
-`test_max_nodes` failed under machine load during labelling and passes when re-run alone on
-those patches, so those labels were corrected.
-
-## Reproduce
-
-```bash
-python3 self_test.py                               # protocol, patch handling, fallbacks
-
-export KIT=$HOME/blast-official                    # unpacked starter kit (score.py, sample/)
-BLAST_DATA=$KIT/sample python3 selector.py > output.jsonl
-python3 $KIT/score.py $KIT/sample $KIT/sample/answers.json output.jsonl
-BLAST_DEBUG=1 BLAST_DATA=$KIT/sample python3 selector.py 2>&1 >/dev/null | less   # reasons
+```sh
+make sample   # build, run once on the 30 sample commits under the scorer's limits, and score
+make check    # the output's format only
 ```
 
-Rebuilding the index (Python 3.13 with the packages of the kit's `requirements.lock`, a clean
-sqlglot checkout at the pinned commit; about 15 minutes on a large machine):
+`make sample` prints your simulated seconds and misses, which are exact for that output. The board adds the CPU seconds your container used and takes the middle of 3 runs, so expect it a little higher. Your program never sees `sample/answers.json`: only the patches and `tests.json` are mounted.
 
-```bash
-python tools/trace_all.py  $SQLGLOT $KIT/sample/tests.json raw_a      # one fresh process tree per test
-python tools/trace_all.py  $SQLGLOT $KIT/sample/tests.json raw_b      # again: other hash seed
-(cd $SQLGLOT && SKIP_INTEGRATION=0 BLAST_TRACE_ROOT=$SQLGLOT BLAST_SUITE_RAW=$PWD/raw_suite \
-   BLAST_TESTS_JSON=$KIT/sample/tests.json PYTHONPATH=$SQLGLOT:/path/to/tools \
-   python -m pytest -p suite_trace -p no:cacheprovider tests)        # whole suite, one process
-python tools/class_info.py $SQLGLOT > class_info.json
-python tools/build_index.py $SQLGLOT $KIT/sample/tests.json raw_a,raw_b,raw_suite blast_index.zip class_info.json
-```
+`sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 
-Checking for missed failures without the sample answers (this is how the rules above were
-validated):
+## Submit
 
-```bash
-python tools/mutants.py gen   $SQLGLOT mut 240 1 code,code,code,class,fixture,test
-python tools/mutants.py label $SQLGLOT $KIT/sample/tests.json mut    # full pytest run per mutant
-BLAST_DATA=mut python3 selector.py > mut/out.jsonl
-python3 $KIT/score.py mut mut/answers.json mut/out.jsonl
-```
+Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.
 
-## Files
+## Rules
 
-| File | Use |
-| --- | --- |
-| `Dockerfile` | The image the scorer builds: official base image, `selector.py`, `blast_index.zip`. No network needed beyond the base image. |
-| `selector.py` | Entry point. Reads `/data/tests.json` and `/data/commits/*.patch`, prints one JSON line per commit. |
-| `blast_index.zip` | Map of the pinned commit: coverage, imports, opened files, class users, base sources. |
-| `tools/tracer/sitecustomize.py` | Tracer loaded into every Python process of a traced test (`sys.monitoring`, audit hook). |
-| `tools/trace_all.py`, `tools/run_one.py` | Run every catalog test alone and collect its trace. |
-| `tools/suite_trace.py` | pytest plugin: per-test function lines with the suite in one process. |
-| `tools/class_info.py` | Lists classes whose construction the tracer can observe. |
-| `tools/build_index.py` | Turns traces into `blast_index.zip`. |
-| `tools/mutants.py`, `tools/blast_report.py` | Make and label our own mutated commits to measure misses. |
-| `self_test.py`, `check_output.py` | Offline tests and an output validator. |
-| `.github/workflows/verify.yml` | Builds the image on GitHub, runs it under the scorer's limits, scores it with the kit's `score.py`. |
+- Submit your own team's repository. A submission with the same repository, commit or archive as another team's is disqualified, the later one.
+- Your build may download only from public package registries: PyPI, npm, Docker Hub, GitHub releases at a fixed tag, and sqlglot’s own repository at the pinned commit. Nothing from an address your team controls. The final rebuilds every image after the cutoff, so anything else could change a submission after the deadline.
+- No answers worked out ahead of time and looked up by patch: no table from a patch, or from a kind of edit, to the tests it breaks. Maps built from the pinned commit (coverage, imports, fixtures) are allowed. Top entries are read.
+- Only the final counts. The practice board carries no prize.
 
-## Known limits
+## How your image runs
 
-* Coverage is evidence from the clean commit. A change that makes a test reach code it never
-  reached before, through data rather than through a line the test ran, can be missed.
-* The class narrowing is a heuristic: it assumes class-level data is read through instances of
-  the class or by naming it. It is only applied to files that nearly every test imports.
-* Tests that take 20–30 s (`test_max_nodes`, `test_execute_tpcds`) cover much of the core, so
-  commits that touch widely used code still cost about 25 s.
+- The build has the network, 4 cores, 8 GB of memory and 10 minutes. It may clone sqlglot at the pinned commit, install it and run its tests to make coverage or import maps.
+- Your repository may hold 20 MB. Git submodules and Git LFS files are not fetched: clone sqlglot in the `Dockerfile` and commit maps as plain files.
+- The run has no network, 2 cores, 4 GB of memory and 3 minutes for the whole batch (4.5 in the final, which has about one and a half times as many commits).
+- The disk is read-only. `/tmp` holds 64 MB and is empty at the start of every run.
+- The container runs as user `nobody`, with `HOME=/tmp` and at most 256 processes.
+- stdout may hold 2 MB. More rejects the run.
+
+## Things that will catch you
+
+- Logs go to stderr. Any line on stdout that is not an answer rejects the run.
+- `score.py` names a broken rule by its code, as in `Rejected: not_json on line 1`. The table in SCORING.md says what each code means.
+- Files your program needs must be readable by `nobody`. A map written by `root` during the build with mode 600 is not.
+- pytest 9 prints a test as `PASSED` beside `SUBFAILED` lines when one of its subtests fails. That test failed.
+- sqlglot skips its executor tests unless `SKIP_INTEGRATION=0` is set. We labeled with it set, so those tests can fail.
+- `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
+- The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
+- A change that only adds a comment is not promised to be harmless.

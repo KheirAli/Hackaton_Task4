@@ -1,223 +1,206 @@
-#!/usr/bin/env python3
-"""Self-made labelled commits for checking the selector WITHOUT the sample answers.
+"""Dev/build calibration from the PINNED repo only (no sample patches, no answers).
 
-  mutants.py gen   SQLGLOT_ROOT OUT_DIR COUNT SEED [KINDS]   write OUT_DIR/commits/*.patch
-  mutants.py label SQLGLOT_ROOT TESTS_JSON OUT_DIR [JOBS]    run pytest per patch, write answers.json
+Generates synthetic single-site mutants on lines covered by each expensive test, runs the
+selector's own static candidates through the verifier, and measures how often an expensive test
+fails while every cheaper candidate passes. That conditional rate decides whether listing an
+expensive test is worth it when its cheaper co-covering tests all pass.
 
-KINDS is a comma list from: code, class, fixture, test (default "code").
-"class" restricts code edits to statements that sit directly in a class body.
-"cmp" swaps the operator of a comparison inside a function for another one.
-Each mutant is one small edit of the pinned checkout. `label` applies it to a
-private copy, runs the whole suite the way the organisers describe, and records
-which catalog tests fail. The result has the layout of the official sample, so
-selector.py and score.py run on it unchanged.
+usage: python tools/mutants.py N_PER_TEST OUT.json [workers]
 """
 import ast
 import difflib
+import gzip
 import json
+import multiprocessing as mp
 import os
 import random
-import re
-import shutil
-import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 
-RULES = [
-    (r" is not ", " is "), (r" is (?!not )", " == "), (r" == ", " != "), (r" != ", " == "),
-    (r" and ", " or "), (r" or ", " and "), (r" < ", " <= "), (r" > ", " >= "),
-    (r" <= ", " < "), (r" >= ", " > "), (r"\bTrue\b", "False"), (r"\bFalse\b", "True"),
-    (r"\bnot ", ""), (r" \+ ", " - "), (r"(?<![\w.\"'])(\d+)(?![\w.\"'])", None),
-    (r"(?<!for \w)(?<!for \w\w) in ", " not in "),
-]
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, HERE)
+ROOT = os.path.join(HERE, '.build/sqlglot')
+EXPENSIVE_S = 2.0
+
+EQUIV_SWAP = {ast.Is: ast.Eq, ast.Eq: ast.Is, ast.IsNot: ast.NotEq, ast.NotEq: ast.IsNot}
+CMP_SWAP = {ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Lt: ast.LtE, ast.LtE: ast.Lt, ast.Gt: ast.GtE,
+            ast.GtE: ast.Gt, ast.Is: ast.IsNot, ast.IsNot: ast.Is, ast.In: ast.NotIn, ast.NotIn: ast.In}
 
 
-def mutate_line(line, rng):
+def mutations(node):
+    """Yield (description, mutate_fn) for one AST node. mutate_fn mutates in place."""
+    if isinstance(node, ast.Compare):
+        for i, op in enumerate(node.ops):
+            if type(op) in CMP_SWAP:
+                yield 'cmp', lambda n=node, i=i: n.ops.__setitem__(i, CMP_SWAP[type(n.ops[i])]())
+            if type(op) in EQUIV_SWAP and isinstance(node.comparators[i], (ast.Constant, ast.Attribute)):
+                yield 'is-eq', lambda n=node, i=i: n.ops.__setitem__(i, EQUIV_SWAP[type(n.ops[i])]())
+    if isinstance(node, ast.BoolOp):
+        yield 'boolop', lambda n=node: setattr(n, 'op', ast.Or() if isinstance(n.op, ast.And) else ast.And())
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        yield 'not', None  # handled by parent replacement
+    if isinstance(node, ast.Constant):
+        if node.value is True or node.value is False:
+            yield 'bool', lambda n=node: setattr(n, 'value', not n.value)
+        elif isinstance(node.value, int) and not isinstance(node.value, bool):
+            yield 'int', lambda n=node: setattr(n, 'value', n.value + 1)
+        elif isinstance(node.value, str) and node.value and len(node.value) < 40:
+            yield 'str', lambda n=node: setattr(n, 'value', n.value + 'x')
+    if isinstance(node, ast.BinOp):
+        swap = {ast.Add: ast.Sub, ast.Sub: ast.Add, ast.Mult: ast.FloorDiv, ast.FloorDiv: ast.Mult}
+        if type(node.op) in swap:
+            yield 'binop', lambda n=node: setattr(n, 'op', swap[type(n.op)]())
+    if isinstance(node, (ast.If, ast.While)) :
+        yield 'negate', lambda n=node: setattr(n, 'test', ast.UnaryOp(op=ast.Not(), operand=n.test))
+
+
+def make_mutant(rel, line, rng):
+    src = open(os.path.join(ROOT, rel), encoding='utf-8').read()
+    tree = ast.parse(src)
     options = []
-    for pattern, repl in RULES:
-        for match in re.finditer(pattern, line):
-            new = str(int(match.group(1)) + 1) if repl is None else repl
-            options.append(line[:match.start()] + new + line[match.end():])
-    return rng.choice(options) if options else None
-
-
-def gen(root, out, count, seed, kinds):
-    rng = random.Random(seed)
-    os.makedirs(os.path.join(out, "commits"), exist_ok=True)
-    files = subprocess.run(["git", "-C", root, "ls-files"], capture_output=True, text=True).stdout.split()
-    pools = {
-        "code": [f for f in files if f.startswith("sqlglot/") and f.endswith(".py")],
-        "test": [f for f in files if f.startswith("tests/") and f.endswith(".py")],
-        "fixture": [f for f in files if f.startswith("tests/fixtures/") and f.endswith(".sql")],
-    }
-    lines_of = {}
-    weighted = {k: [] for k in pools}
-    for kind, names in pools.items():
-        for name in names:
-            text = open(os.path.join(root, name), encoding="utf-8").read()
-            lines_of[name] = text.split("\n")
-            weighted[kind].extend((name, i) for i in range(len(lines_of[name])))
-    weighted["class"] = []
-    for name in pools["code"]:
-        for node in ast.walk(ast.parse("\n".join(lines_of[name]))):
-            if isinstance(node, ast.ClassDef):
-                for stmt in node.body:
-                    if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        weighted["class"].extend((name, i) for i in range(stmt.lineno - 1, stmt.end_lineno))
-    # "cmp": swap the operator of a single-operator comparison inside a function.
-    cmp_ops = {"Is": "is", "IsNot": "is not", "Eq": "==", "NotEq": "!=", "Lt": "<", "LtE": "<=", "Gt": ">", "GtE": ">="}
-    cmp_sites = []
-    funcs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-
-    def find_cmp(node, name, inside):
-        if inside and isinstance(node, ast.Compare) and len(node.ops) == 1 and type(node.ops[0]).__name__ in cmp_ops:
-            left, right = node.left, node.comparators[0]
-            if left.end_lineno == right.lineno:
-                cmp_sites.append((name, left.end_lineno - 1, left.end_col_offset, right.col_offset,
-                                  type(node.ops[0]).__name__))
-        for child in ast.iter_child_nodes(node):
-            find_cmp(child, name, inside or isinstance(node, funcs))
-
-    if "cmp" in kinds:
-        for name in pools["code"]:
-            find_cmp(ast.parse("\n".join(lines_of[name])), name, False)
-    made, kinds_meta = 0, {}
-    while made < count:
-        kind = kinds[made % len(kinds)]
-        if kind == "cmp":
-            name, i, start, end, op = rng.choice(cmp_sites)
-            text = lines_of[name][i]
-            raw_bytes = text.encode("utf-8")
-            new_op = rng.choice([o for o in cmp_ops if o != op])
-            gap = raw_bytes[start:end].decode("utf-8")
-            if gap.strip() != cmp_ops[op]:
-                continue
-            new_line = raw_bytes[:start].decode("utf-8") + " " + cmp_ops[new_op] + " " + raw_bytes[end:].decode("utf-8")
-            old = lines_of[name]
-            new = old[:i] + [new_line] + old[i + 1:]
-            diff = "".join(difflib.unified_diff(
-                [l + "\n" for l in old[:-1]] + ([old[-1]] if old[-1] else []),
-                [l + "\n" for l in new[:-1]] + ([new[-1]] if new[-1] else []),
-                "a/" + name, "b/" + name, n=3))
-            cid = "mq%04d" % (made + seed * 10000)
-            with open(os.path.join(out, "commits", cid + ".patch"), "w", encoding="utf-8") as handle:
-                handle.write("diff --git a/%s b/%s\n" % (name, name) + diff)
-            kinds_meta[cid] = {"kind": kind, "file": name, "line": i + 1, "op": op + ">" + new_op}
-            made += 1
-            continue
-        name, i = rng.choice(weighted[kind])
-        old = lines_of[name]
-        line = old[i]
-        if not line.strip() or line.lstrip().startswith(("#", "--")):
-            continue
-        if kind == "fixture":
-            words = line.split(" ")
-            pos = rng.randrange(len(words) + 1)
-            words.insert(pos, rng.choice(["42", "x", "NULL", "0"]))
-            new_line = " ".join(words)
-        else:
-            new_line = mutate_line(line, rng)
-            if new_line is None:
-                continue
-        new = old[:i] + [new_line] + old[i + 1:]
-        if kind != "fixture":
-            try:
-                if ast.dump(ast.parse("\n".join(new))) == ast.dump(ast.parse("\n".join(old))):
-                    continue
-            except SyntaxError:
-                continue
-        diff = "".join(difflib.unified_diff(
-            [l + "\n" for l in old[:-1]] + ([old[-1]] if old[-1] else []),
-            [l + "\n" for l in new[:-1]] + ([new[-1]] if new[-1] else []),
-            "a/" + name, "b/" + name, n=3))
-        cid = "m%s%04d" % (kind[0], made + seed * 10000)
-        with open(os.path.join(out, "commits", cid + ".patch"), "w", encoding="utf-8") as handle:
-            handle.write("diff --git a/%s b/%s\n" % (name, name) + diff)
-        kinds_meta[cid] = {"kind": kind, "file": name, "line": i + 1}
-        made += 1
-    json.dump(kinds_meta, open(os.path.join(out, "kinds.json"), "w"), indent=0)
-
-
-def label(root, tests_json, out, jobs):
-    here = os.path.dirname(os.path.abspath(__file__))
-    tests = json.load(open(tests_json))["tests"]
-    number = {t["id"]: t["number"] for t in tests}
-    by_file = {}
-    for t in tests:
-        by_file.setdefault(t["file"], []).append(t["number"])
-    kinds = json.load(open(os.path.join(out, "kinds.json")))
-    scratch = os.environ.get("BLAST_SCRATCH", "/dev/shm/blast_mut_%d" % os.getpid())
-    results = os.path.join(out, "results")
-    os.makedirs(results, exist_ok=True)
-    cpus = sorted(os.sched_getaffinity(0))
-    per = 4
-
-    def run(job):
-        slot, cid = job
-        done = os.path.join(results, cid + ".json")
-        if os.path.exists(done):
-            return
-        copy = os.path.join(scratch, cid)
-        shutil.rmtree(copy, ignore_errors=True)
-        os.makedirs(copy)
-        for item in ("sqlglot", "tests", "sqlglotc", "setup.py", "setup.cfg", "pyproject.toml"):
-            src = os.path.join(root, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, os.path.join(copy, item), ignore=shutil.ignore_patterns("__pycache__"))
-            elif os.path.exists(src):
-                shutil.copy(src, copy)
-        patch = os.path.abspath(os.path.join(out, "commits", cid + ".patch"))
-        applied = subprocess.run(["patch", "-p1", "-s", "-i", patch], cwd=copy, capture_output=True, text=True)
-        if applied.returncode:
-            raise RuntimeError("patch failed for %s: %s" % (cid, applied.stdout + applied.stderr))
-        report = os.path.join(copy, "report.json")
-        mine = cpus[(slot * per) % len(cpus):][:per]
-        env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", BLAST_REPORT=report,
-                   PYTHONPATH=copy + os.pathsep + here,
-                   PATH=os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", ""))
-        try:
-            subprocess.run(["taskset", "-c", ",".join(map(str, mine)), sys.executable, "-m", "pytest",
-                            "-p", "blast_report", "-p", "no:cacheprovider", "-q", "-n", str(per),
-                            "--timeout", "300", "tests"],
-                           cwd=copy, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1500)
-            data = json.load(open(report))
-        except Exception as exc:  # noqa: BLE001
-            data = {"error": repr(exc)}
-        failing = set()
-        if "error" not in data:
-            for node in data["failed"]:
-                if node in number:
-                    failing.add(number[node])
-                elif node in by_file:
-                    failing.update(by_file[node])
-            for node in data["broken"]:
-                failing.update(by_file.get(node, []))
-                if node not in by_file:
-                    data.setdefault("odd", []).append(node)
-        data["failing"] = sorted(failing)
-        json.dump(data, open(done, "w"))
-        shutil.rmtree(copy, ignore_errors=True)
-
-    todo = sorted(kinds)
-    with ThreadPoolExecutor(jobs) as pool:
-        list(pool.map(run, [(i % jobs, cid) for i, cid in enumerate(todo)]))
-    answers, errors = {}, []
-    for cid in todo:
-        data = json.load(open(os.path.join(results, cid + ".json")))
-        if "error" in data or data.get("odd"):
-            errors.append((cid, data.get("error"), data.get("odd")))
-        answers[cid] = {"failing": data["failing"], "kind": kinds[cid]["kind"]}
-    json.dump({"commits": answers}, open(os.path.join(out, "answers.json"), "w"))
-    shutil.copy(tests_json, os.path.join(out, "tests.json"))
-    shutil.rmtree(scratch, ignore_errors=True)
-    killed = sum(1 for a in answers.values() if a["failing"])
-    print("labelled %d mutants, %d break something, %d errors %s" % (len(answers), killed, len(errors), errors[:5]),
-          file=sys.stderr)
-
-
-if __name__ == "__main__":
-    if sys.argv[1] == "gen":
-        kinds = sys.argv[6].split(",") if len(sys.argv) > 6 else ["code"]
-        gen(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), kinds)
+    for node in ast.walk(tree):
+        if getattr(node, 'lineno', None) == line and getattr(node, 'end_lineno', None) == line or \
+                isinstance(node, (ast.If, ast.While)) and getattr(node, 'lineno', None) == line:
+            for desc, fn in mutations(node):
+                if fn is not None:
+                    options.append((desc, node, fn))
+    if not options:
+        return None
+    desc, node, fn = rng.choice(options)
+    # Re-render only the mutated line: unparse the smallest single-line statement holding it.
+    lines = src.split('\n')
+    stmt = None
+    for n in ast.walk(tree):
+        if isinstance(n, ast.stmt) and n.lineno == line and n.end_lineno == line:
+            stmt = n
+    if stmt is None and isinstance(node, (ast.If, ast.While)) and node.test.lineno == node.test.end_lineno == line:
+        fn()
+        text = lines[line - 1]
+        indent = text[:len(text) - len(text.lstrip())]
+        kw = 'if' if isinstance(node, ast.If) else 'while'
+        if not text.lstrip().startswith((kw + ' ', 'elif ')) or not text.rstrip().endswith(':'):
+            return None
+        head = 'elif ' if text.lstrip().startswith('elif ') else kw + ' '
+        lines[line - 1] = f'{indent}{head}{ast.unparse(node.test)}:'
+    elif stmt is not None and not isinstance(stmt, (ast.If, ast.While, ast.For, ast.With, ast.Try) + (ast.FunctionDef, ast.ClassDef)):
+        fn()
+        text = lines[line - 1]
+        indent = text[:len(text) - len(text.lstrip())]
+        lines[line - 1] = indent + ast.unparse(stmt)
     else:
-        label(sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]) if len(sys.argv) > 5 else 12)
+        return None
+    new = '\n'.join(lines)
+    if new == src:
+        return None
+    try:
+        compile(new, rel, 'exec')
+    except SyntaxError:
+        return None
+    diff = ''.join(difflib.unified_diff(src.splitlines(True), new.splitlines(True), f'a/{rel}', f'b/{rel}'))
+    return desc, f'diff --git a/{rel} b/{rel}\n' + diff
+
+
+_state = {}
+
+
+def _init():
+    os.environ['BR_SQLGLOT'] = ROOT
+    sys.modules['verify_driver'] = None
+    import selector, verify
+    tests = json.load(open(os.path.join(HERE, 'sample/tests.json')))['tests']
+    index = json.load(gzip.open(os.path.join(HERE, 'index.json.gz'), 'rt'))
+    _state['sel'] = selector.Selector(tests, index, ROOT)
+    _state['selector'] = selector
+    _state['verify'] = verify
+    verify.preload()
+
+
+def _run(sel, verify, sources, numbers):
+    ids = [sel.by_number[n]['id'] for n in numbers]
+    cpu = sel.index.get('cpu_ms', {})
+    to = {i: max(3.0, 8 * cpu.get(i, 1000) / 1000) for i in ids}
+    pid, fd = verify.start(sel.root, sources, ids, to)
+    res = verify.finish(pid, fd)
+    if 'failed' not in res:
+        return None
+    number_of = {t['id']: t['number'] for t in sel.tests}
+    out = set()
+    for f in res['failed']:
+        if isinstance(f, list):
+            out |= set(numbers)
+        elif f in number_of:
+            out.add(number_of[f])
+    return out
+
+
+def job(args):
+    target, rel, line, desc, patch = args
+    sel, verify = _state['sel'], _state['verify']
+    cand, reasons, sources = sel.analyze(patch)
+    if cand == _state['selector'].EVERYTHING or target not in cand:
+        return {'target': target, 'rel': rel, 'line': line, 'desc': desc, 'skip': 'not-candidate'}
+    if len(cand) > len(sel.all) * 0.5:
+        return {'target': target, 'rel': rel, 'line': line, 'desc': desc, 'skip': 'broad', 'n_cand': len(cand)}
+    expensive = {n for n in cand if sel.by_number[n]['seconds'] >= EXPENSIVE_S}
+    cheap = sorted(cand - expensive)
+    cheap_failed = _run(sel, verify, sources, cheap) if cheap else set()
+    if cheap_failed is None:
+        return {'target': target, 'rel': rel, 'line': line, 'desc': desc, 'skip': 'error'}
+    rec = {'target': target, 'rel': rel, 'line': line, 'desc': desc, 'n_cand': len(cand),
+           'n_cheap': len(cheap), 'cheap_failed': len(cheap_failed)}
+    if not cheap_failed:
+        exp_failed = _run(sel, verify, sources, [target])
+        rec['target_failed'] = None if exp_failed is None else bool(exp_failed)
+    return rec
+
+
+def main():
+    n_per = int(sys.argv[1])
+    out = sys.argv[2]
+    workers = int(sys.argv[3]) if len(sys.argv) > 3 else 6
+    tests = json.load(open(os.path.join(HERE, 'sample/tests.json')))['tests']
+    index = json.load(gzip.open(os.path.join(HERE, 'index.json.gz'), 'rt'))
+    number_of = {t['id']: t['number'] for t in tests}
+    idx = [number_of.get(t) for t in index['tests']]
+    targets = [t['number'] for t in tests if t['seconds'] >= EXPENSIVE_S]
+    only = os.environ.get('TARGETS')
+    if only:
+        targets = [n for n in targets if any(k in tests[n]['id'] for k in only.split(','))]
+    rng = random.Random(int(os.environ.get('SEED', '1234')))
+    jobs = []
+    for target in targets:
+        lines = []
+        for rel, table in index['files'].items():
+            if not rel.startswith('sqlglot/'):
+                continue
+            for n, i in table.items():
+                if any(idx[x] == target for x in index['sets'][i]):
+                    lines.append((rel, int(n)))
+        rng.shuffle(lines)
+        got = 0
+        for rel, n in lines:
+            m = make_mutant(rel, n, rng)
+            if m:
+                jobs.append((target, rel, n) + m)
+                got += 1
+                if got >= n_per:
+                    break
+    # interleave targets so partial results cover every expensive test
+    buckets = {}
+    for j in jobs:
+        buckets.setdefault(j[0], []).append(j)
+    jobs = [b[i] for i in range(max(map(len, buckets.values()))) for b in buckets.values() if i < len(b)]
+    print(f'{len(jobs)} jobs over {len(targets)} expensive tests', file=sys.stderr)
+    ctx = mp.get_context('fork')
+    results = []
+    with ctx.Pool(workers, initializer=_init) as pool:
+        for k, r in enumerate(pool.imap_unordered(job, jobs)):
+            if r:
+                results.append(r)
+            if k % 20 == 0:
+                print(k, len(results), file=sys.stderr)
+                json.dump(results, open(out, 'w'))
+    json.dump(results, open(out, 'w'))
+
+
+if __name__ == '__main__':
+    main()
