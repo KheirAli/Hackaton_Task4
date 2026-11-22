@@ -1,757 +1,1063 @@
-#!/usr/bin/env python3
-"""RWX Blast Radius selector.
+"""Blast Radius selector.
 
-For each patch, pick the tests whose recorded execution on the clean pinned
-sqlglot commit touches what the patch changes, then pack them onto workers.
+For each patch to sqlglot (pinned eb11aec), pick the tests that could fail and
+pack them onto the cheapest number of workers.
 
-Evidence comes from blast_index.zip, a map of the pinned commit only (built by
-tools/): every catalog test was run alone in a fresh process tree and we kept
-  * which lines it ran inside functions (call time),
-  * which files it imported and which lines ran at import time,
-  * which repository files it opened (fixtures, data, sources read as text).
-
-Per changed file:
-  * Python: the patch is applied to the base text and old/new ASTs are compared.
-    Identical ASTs (comments, blank lines) change nothing. A difference inside
-    a function body selects the tests that ran those lines; a difference in a
-    signature selects the tests that ran the function; a difference in module
-    or class level code selects every test that imported the file.
-  * Anything else: the tests that opened the file.
-Anything the selector cannot explain falls back to a wider set, in the end to
-every test. No patch, edit kind or answer is looked up anywhere.
-
-Stdout carries exactly one JSON line per commit; diagnostics go to stderr.
+How a test set is chosen, per changed file:
+  * Python, only comments or blank lines changed (same token stream): no tests.
+  * Python that no longer compiles: every test.
+  * A changed line inside a function body: the tests that ran that statement
+    on the pinned commit (per-test coverage map, see mapgen/).
+  * A changed import-time statement (module or class level constant, def
+    header, new method): tests that ran code using the names it defines,
+    following names derived from them at import time; every test when the
+    chain reaches import-time use.
+  * A data file (fixtures): the tests that opened it on the pinned commit.
+  * Anything unknown: every test. A miss costs 300 s, running everything
+    about 37 s, so when in doubt the selector runs everything.
 """
+
+from __future__ import annotations
+
 import ast
+import gzip
+import io
 import json
 import os
 import re
 import sys
-import zipfile
+import tokenize
 from pathlib import Path
 
 DATA = Path(os.environ.get("BLAST_DATA", "/data"))
-INDEX = Path(os.environ.get("BLAST_INDEX", Path(__file__).resolve().parent / "blast_index.zip"))
-DEBUG = os.environ.get("BLAST_DEBUG") == "1"
-CLASS_NARROWING = os.environ.get("BLAST_CLASS_NARROWING", "1") == "1"
-CONST_NARROWING = os.environ.get("BLAST_CONST_NARROWING", "1") == "1"
-CMP_PROFILE = os.environ.get("BLAST_CMP_PROFILE", "1") == "1"
-# Operator swaps whose outcome on given operands is stable from run to run: identity
-# against equality, and a strict bound against its inclusive form (they differ only
-# when the operands are equal). Other swaps, e.g. == to <=, can depend on values
-# that change between runs (hashes, ids), so the profile is not used for them.
-SAFE_SWAPS = {("Is", "Eq"), ("Eq", "Is"), ("IsNot", "NotEq"), ("NotEq", "IsNot"),
-              ("Lt", "LtE"), ("LtE", "Lt"), ("Gt", "GtE"), ("GtE", "Gt")}
-EAGER_SHARE = float(os.environ.get("BLAST_EAGER_SHARE", "0.9"))
+APP = Path(os.environ.get("BLAST_APP", "/app"))
+SRC = Path(os.environ.get("BLAST_SRC", str(APP / "src")))
 MAX_WORKERS = 8
-WORKER_OVERHEAD_MS = 2000
-FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef)
-# Files that change how the whole suite is collected or how every process starts.
-GLOBAL_FILES = {"conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "sitecustomize.py", "usercustomize.py"}
-# Files that can carry pytest configuration; they matter only if the patch adds some.
-CONFIG_FILES = {"setup.cfg", "pyproject.toml"}
-# Module-level names that test runners call without anyone mentioning them.
-HOOK_NAMES = {"setUpModule", "tearDownModule", "setup_module", "teardown_module", "setup_function",
-              "teardown_function", "load_tests", "conftest"}
+WORKER_COST_MS = 2000
+ALL = None  # "every test"
+UNKNOWN = object()  # "the map has nothing on this": callers fall back to another rule
+
+NO_EFFECT_PREFIXES = ("docs/", "posts/", "benchmarks/", "pdoc/", ".github/")
+NO_EFFECT_SUFFIXES = (".md", ".rst", ".txt", ".png", ".jpg", ".svg", ".gif")
+NO_EFFECT_FILES = {"LICENSE", "CHANGELOG.md", "README.md", "CONTRIBUTING.md", "AGENTS.md", "CLAUDE.md", ".gitignore"}
 
 
-class Everything(Exception):
-    """Raised when a change cannot be bounded: select every test."""
+def log(*a):
+    print(*a, file=sys.stderr)
 
 
-def log(*parts):
-    if DEBUG:
-        print(*parts, file=sys.stderr)
+class Map:
+    def __init__(self, path: Path):
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            d = json.load(f)
+        self.tests = d["tests"]
+        self.sets = d["sets"]
+        self.lines = d["lines"]
+        self.opens = d["opens"]
+        self.refs = d["refs"]
+        self.derive = d["derive"]
+        self.import_use = set(d["import_use"])
+        self.classes = d.get("classes", {})
+        self.class_uses = d.get("class_uses", {})
+        self.qrefs = d.get("qrefs", {})
+        self.qderive = d.get("qderive", {})
+        self.str_names = set(d.get("str_names", []))
+        self.classes_import = set(d.get("classes_import", []))
+        self.cmp_differ = d.get("cmp_differ", {})
+        self.cmp_seen = set(d.get("cmp_seen", []))
+        self.pool_groups = [set(self.sets[g]) for g in d.get("pool_groups", []) if g != -1]
+        self.by_file: dict[str, set[int]] = {}
+        for i, t in enumerate(self.tests):
+            self.by_file.setdefault(t.split("::", 1)[0], set()).add(i)
+        self.test_index = {t: i for i, t in enumerate(self.tests)}
+        self.pool_ast_pos: dict[int, int] = {}
+        for g in self.pool_groups:
+            files_classes: dict[str, dict[str, list[tuple[str, int]]]] = {}
+            for t_idx in g:
+                parts = self.tests[t_idx].split("::")
+                if len(parts) == 3:
+                    fpath, cname, mname = parts
+                    files_classes.setdefault(fpath, {}).setdefault(cname, []).append((mname, t_idx))
+            for fpath, classes in files_classes.items():
+                f_src = SRC / fpath
+                if not f_src.is_file():
+                    continue
+                try:
+                    tree = ast.parse(f_src.read_text(encoding="utf-8"))
+                    for node in tree.body:
+                        if isinstance(node, ast.ClassDef) and node.name in classes:
+                            ast_order = {}
+                            pos = 0
+                            for item in node.body:
+                                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test_"):
+                                    ast_order[item.name] = pos
+                                    pos += 1
+                            for mname, t_idx in classes[node.name]:
+                                if mname in ast_order:
+                                    self.pool_ast_pos[t_idx] = ast_order[mname]
+                except Exception as e:  # noqa: BLE001
+                    log(f"error parsing {fpath} for pool AST order: {e!r}")
 
-
-# --------------------------------------------------------------------------- index
-
-
-class Index:
-    def __init__(self, path):
-        self.zip = zipfile.ZipFile(path)
-        meta = json.loads(self.zip.read("meta.json"))
-        self.tests = meta["tests"]
-        self.opens = meta["opens"]
-        self.files = set(meta["files"])
-        self.cov_names = set(meta["cov"])
-        self.untraced = meta.get("untraced", [])
-        self.lists = meta.get("lists")
-        self.no_lists = meta.get("no_lists", "0")
-        self._all_src = None
-        self._cov = {}
-        self._src = {}
-        self._tree = {}
-        self._dir_opens = {}
-
-    def cov(self, name):
-        if name not in self._cov:
-            if name in self.cov_names:
-                raw = json.loads(self.zip.read("cov/" + name + ".json"))
-                sets = [int(s, 16) for s in raw["sets"]]
-                entry = {
-                    "importers": int(raw["importers"], 16),
-                    "implines": raw["implines"],
-                    "lines": {int(k): sets[v] for k, v in raw["lines"].items()},
-                    "classes": [(lo, hi, int(m, 16)) for lo, hi, m in raw.get("classes", ())],
-                    "cmp": raw.get("cmp", {}),
-                    "consts": raw.get("consts", {}),
-                }
-            else:
-                entry = {"importers": 0, "implines": [], "lines": {}, "classes": [], "cmp": {}, "consts": {}}
-            self._cov[name] = entry
-        return self._cov[name]
-
-    def src(self, name):
-        if name not in self._src:
+        self.generator_slots_span = (925, 948)
+        self.generator_init_span = (950, 1010)
+        gen_file = SRC / "sqlglot/generator.py"
+        if gen_file.is_file():
             try:
-                self._src[name] = self.zip.read("src/" + name).decode("utf-8")
-            except KeyError:
-                self._src[name] = None
-        return self._src[name]
+                slots_s = slots_e = init_s = init_e = None
+                for i, line in enumerate(gen_file.read_text(encoding="utf-8").splitlines(), 1):
+                    if line.startswith("    __slots__ = ("):
+                        slots_s = i
+                    elif slots_s and slots_e is None and line.strip().endswith(")"):
+                        slots_e = i
+                    elif line.startswith("    def __init__("):
+                        init_s = i
+                    elif init_s and init_e is None and line.startswith("    def "):
+                        init_e = i - 1
+                if slots_s and slots_e:
+                    self.generator_slots_span = (slots_s, slots_e)
+                if init_s and init_e:
+                    self.generator_init_span = (init_s, init_e)
+            except Exception as e:  # noqa: BLE001
+                log(f"error scanning generator.py spans: {e!r}")
 
-    def tree(self, name):
-        if name not in self._tree:
-            self._tree[name] = ast.parse(self.src(name))
-        return self._tree[name]
+        self.dialect_generator_span = (1378, 1381)
+        dia_file = SRC / "sqlglot/dialects/dialect.py"
+        if dia_file.is_file():
+            try:
+                gen_s = gen_e = None
+                for i, line in enumerate(dia_file.read_text(encoding="utf-8").splitlines(), 1):
+                    if line.startswith("    def generator("):
+                        gen_s = i
+                    elif gen_s and gen_e is None and line.startswith("    def "):
+                        gen_e = i - 1
+                if gen_s and gen_e:
+                    self.dialect_generator_span = (gen_s, gen_e)
+            except Exception as e:  # noqa: BLE001
+                log(f"error scanning dialect.py spans: {e!r}")
 
-    def listers(self, directory):
-        """Tests that enumerated a directory themselves, or None if the index has no such record."""
-        if self.lists is None:
-            return None
-        return int(self.lists.get(directory, self.no_lists), 16)
+    def set_of(self, sid):
+        return ALL if sid == -1 else set(self.sets[sid])
 
-    def identifier_used(self, word):
-        """Does the word occur anywhere in the base Python sources (code, strings, comments)?"""
-        if self._all_src is None:
-            self._all_src = "\n".join(
-                self.zip.read(item).decode("utf-8", "replace") for item in self.zip.namelist() if item.startswith("src/")
-            )
-        return re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(word), self._all_src) is not None
+    def line(self, f, ln):
+        sid = self.lines.get(f, {}).get(str(ln))
+        return set() if sid is None else self.set_of(sid)
 
-    def openers(self, name):
-        return int(self.opens.get(name, "0"), 16)
-
-    def dir_openers(self, name):
-        """Tests that opened anything in the nearest ancestor directory with opened files."""
-        parts = name.split("/")[:-1]
-        while parts:
-            prefix = "/".join(parts) + "/"
-            if prefix not in self._dir_opens:
-                mask = 0
-                for other, hexmask in self.opens.items():
-                    if other.startswith(prefix):
-                        mask |= int(hexmask, 16)
-                self._dir_opens[prefix] = mask
-            if self._dir_opens[prefix]:
-                return self._dir_opens[prefix]
-            parts.pop()
-        return 0
-
-    def touchers(self, name):
-        """Every test with any recorded contact with a Python file."""
-        entry = self.cov(name)
-        mask = entry["importers"] | self.openers(name)
-        for line_mask in entry["lines"].values():
-            mask |= line_mask
-        return mask
-
-    def fn_range(self, name, lo, hi):
-        lines = self.cov(name)["lines"]
-        mask = 0
-        if hi - lo < len(lines):
-            for line in range(lo, hi + 1):
-                mask |= lines.get(line, 0)
-        else:
-            for line, line_mask in lines.items():
-                if lo <= line <= hi:
-                    mask |= line_mask
-        return mask
-
-    def imp_range(self, name, lo, hi):
-        """Tests affected by a change to import-time code on lines lo..hi.
-
-        Normally that is every test that imported the file. When the file is
-        imported by (nearly) every test, that says nothing, so a change that
-        sits strictly inside one top-level class is narrowed to the tests that
-        used that class: ran a method on an instance of it (or of a nested
-        class or subclass), or ran a function line that names it.
-        """
-        entry = self.cov(name)
-        if not any(lo <= line <= hi for line in entry["implines"]):
-            return 0
-        importers = entry["importers"]
-        users = entry["consts"].get("%d-%d" % (lo, hi)) if CONST_NARROWING else None
-        if users is not None:
-            # `NAME = value` at module level, with NAME only ever mentioned inside
-            # functions: the new value reaches a test only through such a line.
-            return int(users, 16) & importers
-        if CLASS_NARROWING and bin(importers).count("1") >= EAGER_SHARE * len(self.tests):
-            for c_lo, c_hi, users in entry["classes"]:
-                if c_lo < lo and hi <= c_hi and (lo, hi) != (c_lo, c_hi):
-                    return users & importers
-        return importers
-
-
-# --------------------------------------------------------------------------- patches
-
-HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-
-
-def _path(raw):
-    raw = raw.split("\t")[0].strip()
-    if raw == "/dev/null":
-        return None
-    if raw.startswith('"'):
-        raise Everything("quoted path")
-    if raw.startswith(("a/", "b/")):
-        raw = raw[2:]
-    return raw
-
-
-def parse_patch(text):
-    """Return a list of file changes: {old, new, hunks, opaque}."""
-    files = []
-    current = None
-    lines = text.split("\n")
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.startswith("diff --git "):
-            current = {"old": None, "new": None, "hunks": [], "opaque": False, "header": line}
-            files.append(current)
-            match = re.match(r"^diff --git a/(.*) b/(.*)$", line)
-            if match and '"' not in line:
-                current["old"], current["new"] = match.group(1), match.group(2)
-                current["guess"] = True
-            i += 1
-            continue
-        if line.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
-            if current is None or current["hunks"] or current.get("named"):
-                current = {"old": None, "new": None, "hunks": [], "opaque": False}
-                files.append(current)
-            current["old"] = _path(line[4:])
-            current["new"] = _path(lines[i + 1][4:])
-            current["named"] = True
-            i += 2
-            continue
-        if current is not None:
-            if line.startswith(("rename from ", "copy from ")):
-                current["old"] = line.split(" ", 2)[2]
-                current["renamed"] = True
-            elif line.startswith(("rename to ", "copy to ")):
-                current["new"] = line.split(" ", 2)[2]
-                current["renamed"] = True
-            elif line.startswith("new file mode"):
-                current["old"], current["created"] = None, True
-            elif line.startswith("deleted file mode"):
-                current["deleted"] = True
-            elif line.startswith(("GIT binary patch", "Binary files ")):
-                current["opaque"] = True
-            elif line.startswith(("old mode", "new mode")):
-                current["mode"] = True
-            match = HUNK.match(line)
-            if match:
-                old_start = int(match.group(1))
-                old_count = int(match.group(2) or 1)
-                new_count = int(match.group(4) or 1)
-                body = []
-                i += 1
-                seen_old = seen_new = 0
-                while i < len(lines) and (seen_old < old_count or seen_new < new_count):
-                    row = lines[i]
-                    tag = row[:1]
-                    if tag == "\\":
-                        if body:
-                            body[-1] = (body[-1][0], body[-1][1], True)
-                    elif tag == "-":
-                        body.append(("-", row[1:], False))
-                        seen_old += 1
-                    elif tag == "+":
-                        body.append(("+", row[1:], False))
-                        seen_new += 1
-                    else:  # context; a fully empty line is an empty context line
-                        body.append((" ", row[1:], False))
-                        seen_old += 1
-                        seen_new += 1
-                    i += 1
-                if i < len(lines) and lines[i].startswith("\\"):
-                    if body:
-                        body[-1] = (body[-1][0], body[-1][1], True)
-                    i += 1
-                current["hunks"].append((old_start, old_count, body))
+    def span(self, f, lo, hi):
+        acc: set[int] = set()
+        fl = self.lines.get(f, {})
+        for ln in range(lo, hi + 1):
+            sid = fl.get(str(ln))
+            if sid is None:
                 continue
-        i += 1
+            if sid == -1:
+                return ALL
+            acc.update(self.sets[sid])
+        return acc
+
+    def names(self, names, limit=60):
+        """Tests that ran code using these names, following import-time derivations."""
+        acc: set[int] = set()
+        seen = set()
+        todo = list(names)
+        while todo:
+            n = todo.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            if len(seen) > limit or n in self.import_use:
+                return ALL
+            sid = self.refs.get(n)
+            if sid == -1:
+                return ALL
+            if sid is not None:
+                acc.update(self.sets[sid])
+            todo.extend(self.derive.get(n, []))
+        return acc
+
+
+def add(acc, s):
+    if acc is ALL or s is ALL:
+        return ALL
+    acc |= s
+    return acc
+
+
+# ---------------------------------------------------------------- patches
+
+def parse_patch(text: str):
+    """-> list of (old_path, new_path, hunks); hunk = (old_start, new_start, [(tag, text)])."""
+    files = []
+    cur = None
+    hunk = None
+    for raw in text.split("\n"):
+        if raw.startswith("diff --git "):
+            cur = {"old": None, "new": None, "hunks": []}
+            files.append(cur)
+            m = re.match(r"diff --git a/(.*) b/(.*)$", raw)
+            if m:
+                cur["old"], cur["new"] = m.group(1), m.group(2)
+            hunk = None
+            continue
+        if cur is None:
+            continue
+        if raw.startswith("--- ") and hunk is None:
+            p = raw[4:].strip()
+            cur["old"] = None if p == "/dev/null" else p[2:] if p.startswith("a/") else p
+            continue
+        if raw.startswith("+++ ") and hunk is None:
+            p = raw[4:].strip()
+            cur["new"] = None if p == "/dev/null" else p[2:] if p.startswith("b/") else p
+            continue
+        m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+        if m:
+            hunk = (int(m.group(1)), int(m.group(2)), [])
+            cur["hunks"].append(hunk)
+            continue
+        if hunk is not None and raw[:1] in (" ", "-", "+"):
+            hunk[2].append((raw[0], raw[1:]))
+        elif hunk is not None and raw.startswith("\\"):
+            continue
+        elif raw.startswith(("new file", "deleted file", "similarity", "rename ", "index ", "old mode", "new mode", "Binary")):
+            cur.setdefault("meta", []).append(raw)
     return files
 
 
-def apply_hunks(base_text, hunks):
-    """Apply hunks strictly. Returns (new_text, old_ranges, new_ranges)."""
-    base = base_text.split("\n")
+def apply_hunks(old_text: str, hunks):
+    old = old_text.split("\n")
     out = []
-    old_ranges, new_ranges = [], []
-    cursor = 0  # index into base
-    for old_start, old_count, body in hunks:
-        start = old_start - 1 if old_count else old_start
-        if start < cursor:
-            raise ValueError("overlapping hunks")
-        out.extend(base[cursor:start])
-        cursor = start
-        for tag, content, no_newline in body:
-            if tag == "+":
-                out.append(content)
-                new_ranges.append((len(out) - 1, len(out) + 1))
-                old_ranges.append((cursor, cursor + 1))
-                if no_newline:
-                    out.append(None)  # marker: file ends here without newline
+    pos = 0  # 0-based index into old
+    for old_start, _new_start, lines in hunks:
+        start = max(old_start - 1, 0) if any(t != "+" for t, _ in lines) else old_start
+        out.extend(old[pos:start])
+        pos = start
+        for tag, text in lines:
+            if tag == " ":
+                out.append(old[pos] if pos < len(old) else text)
+                pos += 1
+            elif tag == "-":
+                pos += 1
             else:
-                if cursor >= len(base) or base[cursor].rstrip("\r") != content.rstrip("\r"):
-                    raise ValueError("context mismatch at old line %d" % (cursor + 1))
-                if tag == " ":
-                    out.append(base[cursor])
-                else:
-                    old_ranges.append((cursor + 1, cursor + 1))
-                    new_ranges.append((len(out), len(out) + 1))
-                cursor += 1
-    out.extend(base[cursor:])
-    out = [row for row in out if row is not None]
-    return "\n".join(out), old_ranges, new_ranges
+                out.append(text)
+    out.extend(old[pos:])
+    return "\n".join(out)
 
 
-# --------------------------------------------------------------------------- AST diff
+def changed_lines(hunks):
+    """-> (deleted old line numbers, [(new line no, old anchor line no)] for added lines)."""
+    dels, adds = [], []
+    for old_start, new_start, lines in hunks:
+        o, n = old_start, new_start
+        if all(t == "+" for t, _ in lines):
+            o = old_start + 1  # "-k,0" means insertion after old line k
+        for tag, text in lines:
+            if tag == " ":
+                o += 1
+                n += 1
+            elif tag == "-":
+                dels.append(o)
+                o += 1
+            else:
+                adds.append((n, o))
+                n += 1
+    return dels, adds
 
 
-def _span(node):
-    lo, hi = node.lineno, node.end_lineno or node.lineno
-    for deco in getattr(node, "decorator_list", ()):
-        lo = min(lo, deco.lineno)
-    return lo, hi
+# ---------------------------------------------------------------- python analysis
+
+def code_tokens(text):
+    skip = {tokenize.COMMENT, tokenize.NL, tokenize.ENCODING}
+    return [(t.type, t.string) for t in tokenize.generate_tokens(io.StringIO(text).readline) if t.type not in skip]
 
 
-def _dump(value):
-    if isinstance(value, list):
-        return "[" + ",".join(_dump(v) for v in value) + "]"
-    if isinstance(value, ast.AST):
-        return ast.dump(value)
-    return repr(value)
+def is_blank_or_comment(line: str) -> bool:
+    s = line.strip()
+    return not s or s.startswith("#")
 
 
-def _touches(node, ranges):
-    lineno = getattr(node, "lineno", None)
-    if lineno is None:
-        return True
-    lo, hi = _span(node)
-    for a, b in ranges:
-        if a <= hi and lo <= b:
-            return True
-    return False
+COMPOUND_FIELDS = ("body", "orelse", "finalbody")
 
 
-def _future_annotations(tree):
-    return any(
-        isinstance(node, ast.ImportFrom) and node.module == "__future__" and any(a.name == "annotations" for a in node.names)
-        for node in tree.body
-    )
+def child_blocks(stmt):
+    for f in COMPOUND_FIELDS:
+        b = getattr(stmt, f, None)
+        if b:
+            yield b
+    for h in getattr(stmt, "handlers", []) or []:
+        yield h.body
+    for c in getattr(stmt, "cases", []) or []:
+        yield c.body
 
 
-def _signature(args, keep_annotations):
-    """Dump of a function's parameters, optionally ignoring annotations."""
-    if keep_annotations:
-        return ast.dump(args)
-    names = [[a.arg for a in group] for group in (args.posonlyargs, args.args, args.kwonlyargs)]
-    return repr((names, args.vararg and args.vararg.arg, args.kwarg and args.kwarg.arg,
-                 _dump(args.defaults), _dump(args.kw_defaults)))
+def header_span(stmt):
+    start = min([stmt.lineno] + [d.lineno for d in getattr(stmt, "decorator_list", [])])
+    blocks = list(child_blocks(stmt))
+    if not blocks:
+        return start, stmt.end_lineno
+    first = min(b[0].lineno for b in blocks if b)
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        body0 = stmt.body[0]
+        first = min(getattr(body0, "decorator_list", []) and [d.lineno for d in body0.decorator_list] or [body0.lineno])
+    return start, max(start, first - 1)
 
 
-def _literal(node):
-    """A value that cannot fail or have an effect when evaluated."""
-    if isinstance(node, ast.Constant):
-        return True
-    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-        return all(_literal(item) for item in node.elts)
-    if isinstance(node, ast.Dict):
-        return all(key is not None and _literal(key) for key in node.keys) and all(_literal(v) for v in node.values)
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        return isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float))
-    return False
-
-
-def _inert_definition(stmt, annotations_lazy):
-    """Names bound by a module-level statement that does nothing but bind them, else None."""
-    if isinstance(stmt, FUNCS):
-        if stmt.decorator_list or getattr(stmt, "type_params", None):
-            return None
-        args = stmt.args
-        if not all(_literal(d) for d in args.defaults + [d for d in args.kw_defaults if d is not None]):
-            return None
-        annotated = stmt.returns is not None or any(
-            a.annotation is not None
-            for a in args.posonlyargs + args.args + args.kwonlyargs + [x for x in (args.vararg, args.kwarg) if x]
-        )
-        if annotated and not annotations_lazy:
-            return None
-        return [stmt.name]
-    if isinstance(stmt, ast.Assign):
-        if all(isinstance(t, ast.Name) for t in stmt.targets) and _literal(stmt.value):
-            return [t.id for t in stmt.targets]
+def locate(tree, ln):
+    """-> (stmt, in_function, is_header, enclosing top-level def) for the innermost statement at line ln."""
+    def walk(body, in_func, owner):
+        for stmt in body:
+            lo = min([stmt.lineno] + [d.lineno for d in getattr(stmt, "decorator_list", [])])
+            if not (lo <= ln <= stmt.end_lineno):
+                continue
+            hlo, hhi = header_span(stmt)
+            is_def = isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+            if hlo <= ln <= hhi:
+                return stmt, in_func, True, owner
+            for block in child_blocks(stmt):
+                r = walk(block, in_func or is_def, owner if (in_func or not is_def) else stmt)
+                if r:
+                    return r
+            return stmt, in_func, True, owner  # e.g. an `else:` line
         return None
-    if isinstance(stmt, ast.AnnAssign):
-        if isinstance(stmt.target, ast.Name) and stmt.value is not None and _literal(stmt.value) and annotations_lazy:
-            return [stmt.target.id]
-    return None
+    return walk(tree.body, False, None)
 
 
-def diff_trees(old, new, old_ranges, new_ranges, unused_name=None):
-    """Regions of the OLD tree that differ: (kind, lo, hi) with kind 'fn' or 'imp',
-    or ('cmp', lo, hi, "line:col", NewOperatorName) for an operator-only comparison edit."""
-    regions = []
-    lazy = _future_annotations(old) and _future_annotations(new)
-
-    def harmless_insert(statements):
-        """New module-level definitions of names nobody mentions cannot change any test."""
-        if unused_name is None:
-            return False
-        for stmt in statements:
-            names = _inert_definition(stmt, lazy)
-            if not names:
-                return False
-            for name in names:
-                if name.startswith("__") or name.startswith("pytest_") or name in HOOK_NAMES or not unused_name(name):
-                    return False
-        return True
-
-    def report(node, fn, stmt):
-        if fn is None:
-            if stmt is None:
-                regions.append(("imp", 1, 10**9))
-            else:
-                regions.append(("imp",) + _span(stmt))
-        elif isinstance(fn, ast.Lambda) or stmt is None or stmt is fn:
-            regions.append(("fn",) + _span(fn))
-        else:
-            lo, hi = _span(stmt)
-            body = getattr(stmt, "body", None)
-            if (
-                node is not stmt
-                and isinstance(node, ast.expr)
-                and isinstance(body, list)
-                and body
-                and isinstance(body[0], ast.stmt)
-                and (node.end_lineno or node.lineno) < body[0].lineno
-            ):
-                hi = body[0].lineno - 1
-            regions.append(("fn", lo, hi))
-
-    def maybe(a, b, fn, stmt):
-        if _touches(a, old_ranges) or _touches(b, new_ranges):
-            walk(a, b, fn, stmt)
-
-    def walk_list(la, lb, fn, stmt, parent):
-        la = la if isinstance(la, list) else []
-        lb = lb if isinstance(lb, list) else []
-        if len(la) == len(lb):
-            for a, b in zip(la, lb):
-                if isinstance(a, ast.AST) and isinstance(b, ast.AST):
-                    maybe(a, b, fn, stmt)
-                elif _dump(a) != _dump(b):
-                    report(parent, fn, stmt)
-            return
-        statements = all(isinstance(x, ast.stmt) for x in la + lb)
-        if not statements:
-            report(parent, fn, stmt)
-            return
-        da, db = [_dump(x) for x in la], [_dump(x) for x in lb]
-        head = 0
-        while head < len(da) and head < len(db) and da[head] == db[head]:
-            head += 1
-        tail = 0
-        while tail < len(da) - head and tail < len(db) - head and da[-1 - tail] == db[-1 - tail]:
-            tail += 1
-        for gone in la[head:len(la) - tail]:
-            report(gone, fn, gone)
-        if len(lb) - tail > head:  # statements were inserted
-            if fn is None and isinstance(parent, ast.Module) and harmless_insert(lb[head:len(lb) - tail]):
-                pass
-            elif isinstance(fn, FUNCS):
-                regions.append(("fn",) + _span(fn))
-            elif fn is not None:
-                report(parent, fn, stmt)
-            elif isinstance(parent, ast.stmt):
-                regions.append(("imp",) + _span(parent))
-            else:
-                regions.append(("imp", 1, 10**9))
-
-    def walk(a, b, fn, stmt):
-        if type(a) is not type(b):
-            report(a, fn, stmt)
-            return
-        if isinstance(a, ast.stmt):
-            stmt = a
-        if fn is None and isinstance(a, (ast.Assign, ast.AnnAssign)):
-            mine = a.targets if isinstance(a, ast.Assign) else [a.target]
-            theirs = b.targets if isinstance(b, ast.Assign) else [b.target]
-            if _dump(mine) != _dump(theirs):
-                # Another name is bound now: no narrowing by statement, the whole scope changed.
-                regions.append(("imp", 1, 10**9))
-                return
-        if isinstance(a, FUNCS):
-            if a.name != b.name or _dump(a.decorator_list) != _dump(b.decorator_list):
-                report(a, fn, a)
-                return
-            # With `from __future__ import annotations` annotations are never evaluated.
-            if (
-                _signature(a.args, not lazy) != _signature(b.args, not lazy)
-                or (not lazy and _dump(a.returns) != _dump(b.returns))
-                or _dump(getattr(a, "type_params", [])) != _dump(getattr(b, "type_params", []))
-            ):
-                regions.append(("fn",) + _span(a))
-            walk_list(a.body, b.body, a, None, a)
-            return
-        if (
-            isinstance(a, ast.Compare)
-            and fn is not None
-            and len(a.ops) == 1 == len(b.ops)
-            and type(a.ops[0]) is not type(b.ops[0])
-            and _dump(a.left) == _dump(b.left)
-            and _dump(a.comparators) == _dump(b.comparators)
-        ):
-            # Only the comparison operator changed: remember the site so the
-            # comparison profile can drop tests for which both operators agree.
-            report(a, fn, stmt)
-            kind, lo, hi = regions.pop()
-            swap = (type(a.ops[0]).__name__, type(b.ops[0]).__name__)
-            regions.append(("cmp", lo, hi, "%d:%d" % (a.lineno, a.col_offset), swap[1], swap in SAFE_SWAPS))
-            return
-        if isinstance(a, ast.Lambda):
-            if _dump(a.args) != _dump(b.args):
-                regions.append(("fn",) + _span(a))
-            walk(a.body, b.body, a, stmt)
-            return
-        for field in a._fields:
-            va, vb = getattr(a, field, None), getattr(b, field, None)
-            if isinstance(va, list) or isinstance(vb, list):
-                walk_list(va, vb, fn, stmt, a)
-            elif isinstance(va, ast.AST) and isinstance(vb, ast.AST):
-                maybe(va, vb, fn, stmt)
-            elif isinstance(va, ast.AST) or isinstance(vb, ast.AST):
-                report(a, fn, stmt)
-            elif va != vb or type(va) is not type(vb):
-                report(a, fn, stmt)
-
-    walk(old, new, None, None)
-    return regions
+def is_docstring(stmt):
+    """A bare string statement: never evaluated for its value (sqlglot doesn't read
+    docstrings, and pytest doesn't collect its doctests)."""
+    return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
 
 
-# --------------------------------------------------------------------------- selection
-
-
-def select_python(index, name, change):
-    """Mask of tests affected by a change to a traced-or-known Python file."""
-    base = index.src(name)
-    try:
-        new_text, old_ranges, new_ranges = apply_hunks(base, change["hunks"])
-    except ValueError as exc:
-        log("   cannot apply:", exc)
-        if index.touchers(name) == 0:
-            raise Everything("unappliable patch to untraced file")
-        return index.touchers(name)
-    try:
-        new_tree = ast.parse(new_text)
-    except (SyntaxError, ValueError) as exc:
-        log("   new source does not parse:", exc)
-        return index.touchers(name)
-    unused = (lambda word: not index.identifier_used(word)) if name.startswith("sqlglot/") else None
-    regions = diff_trees(index.tree(name), new_tree, old_ranges, new_ranges, unused)
-    mask = index.openers(name)  # tests that read this source as text see any edit
-    for kind, lo, hi, *site in regions:
-        if kind == "fn":
-            part = index.fn_range(name, lo, hi)
-        elif kind == "cmp":
-            part = index.fn_range(name, lo, hi)
-            profile = index.cov(name)["cmp"].get(site[0]) if CMP_PROFILE and site[1:] and site[2] else None
-            if profile is not None:
-                # Tests that reached the site keep it only if the new operator ever
-                # disagreed with the old one on their operands. Tests that ran the
-                # line but have no profile for the site are kept.
-                differs = int(profile["d"].get(site[1], "0"), 16)
-                part = differs | (part & ~int(profile["x"], 16))
-        else:
-            part = index.imp_range(name, lo, hi) | index.fn_range(name, lo, hi)
-        log("   %s %d-%s -> %d tests" % (kind, lo, hi if hi < 10**9 else "end", bin(part).count("1")))
-        mask |= part
-    if not regions:
-        log("   no AST change")
-    return mask
-
-
-def select_file(index, change):
-    old, new = change["old"], change["new"]
-    mask = 0
-    if change["opaque"] and not change["hunks"]:
-        log("   binary change")
-    for name in {old, new} - {None}:
-        base = name.rsplit("/", 1)[-1]
-        if base in GLOBAL_FILES:
-            raise Everything("suite configuration file " + name)
-        if base in CONFIG_FILES and "/" not in name:
-            added = [text for _, _, body in change["hunks"] for tag, text, _ in body if tag == "+"]
-            if change["opaque"] or not change["hunks"] or any("pytest" in text.lower() for text in added):
-                raise Everything("possible pytest configuration in " + name)
-    if old is None:  # created file
-        if new is None:
-            raise Everything("patch without paths")
-        if new in index.files:
-            raise Everything("creates a file that exists in the base: " + new)
-        directory, _, base = new.rpartition("/")
-        if new.endswith(".py") and new.startswith(("sqlglot/", "tests/")):
-            # A new module runs only if something imports it by name or walks its directory.
-            stem = base[:-3]
-            if base == "__init__.py" or index.identifier_used(stem):
-                raise Everything("new Python file whose name is mentioned in the code: " + new)
-            listers = index.listers(directory)
-            if listers is None:
-                raise Everything("new Python file " + new)
-            return listers
-        if new.startswith(("sqlglot/", "tests/")):
-            listers = index.listers(directory)
-            return index.dir_openers(new) if listers is None else listers
-        return 0
-    if old not in index.files:
-        raise Everything("unknown base file " + old)
-    renamed = new is None or new != old or change.get("deleted")
-    is_python = old.endswith(".py") and index.src(old) is not None
-    if is_python:
-        if renamed or change["opaque"]:
-            mask |= index.touchers(old)
-            if new and new != old and new.endswith(".py"):
-                raise Everything("Python file moved to " + new)
-        elif change["hunks"]:
-            mask |= select_python(index, old, change)
-        return mask
-    if old.endswith(".py"):
-        return 0 if not change["hunks"] and not renamed else index.openers(old)
-    # data file: fixtures, csv, json, docs, configuration
-    if not change["hunks"] and not renamed and not change["opaque"]:
-        return 0  # mode change only
-    mask = index.openers(old)
-    if not mask and old.startswith("tests/"):
-        mask = index.dir_openers(old)
-    if new and new != old and new.startswith("tests/"):
-        mask |= index.dir_openers(new)
-    return mask
-
-
-def select(index, patch_text):
-    changes = parse_patch(patch_text)
-    if not changes:
-        if patch_text.strip():
-            raise Everything("no file sections recognised")
-        return 0
-    mask = 0
-    for change in changes:
-        log("  file", change["old"], "->", change["new"], "hunks", len(change["hunks"]))
-        if not change.get("named") and not change.get("renamed") and not change["opaque"] \
-                and not change.get("mode") and not change.get("created") and not change.get("deleted"):
-            if change["hunks"]:
-                raise Everything("hunks without file names")
-        part = select_file(index, change)
-        log("  ->", bin(part).count("1"), "tests")
-        mask |= part
-    return mask
-
-
-# --------------------------------------------------------------------------- schedule
-
-
-def schedule(jobs):
-    """jobs: list of (number, ms). LPT for each worker count, keep the cheapest."""
-    if not jobs:
-        return []
-    ranked = sorted(jobs, key=lambda item: (-item[1], item[0]))
-    total = sum(ms for _, ms in ranked)
-    longest = ranked[0][1]
-    best, best_cost = None, None
-    for k in range(1, min(MAX_WORKERS, len(ranked)) + 1):
-        floor = max(longest, -(-total // k)) + WORKER_OVERHEAD_MS * k
-        if best_cost is not None and floor >= best_cost:
-            continue
-        workers = [[] for _ in range(k)]
-        loads = [0] * k
-        for number, ms in ranked:
-            w = loads.index(min(loads))
-            workers[w].append(number)
-            loads[w] += ms
-        used = [w for w in workers if w]
-        cost = max(loads) + WORKER_OVERHEAD_MS * len(used)
-        if best_cost is None or cost < best_cost:
-            best, best_cost = used, cost
+def lambda_body_span(stmt, ln):
+    """(lo, hi) lines of the body of the innermost lambda inside stmt whose body holds
+    line ln; None if ln is not in a lambda body. A lambda body only runs when called."""
+    best = None
+    for n in ast.walk(stmt):
+        if isinstance(n, ast.Lambda):
+            b = n.body
+            if b.lineno <= ln <= b.end_lineno and (best is None or b.lineno >= best[0]):
+                best = (b.lineno, b.end_lineno)
     return best
 
 
-def main():
-    catalog = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
-    patches = sorted((DATA / "commits").glob("*.patch"))
-    all_jobs = [(int(t["number"]), int(float(t["seconds"]) * 1000 + 0.5)) for t in catalog]
-    everything = None
-    try:
-        index = Index(INDEX)
-        bit_of = {test_id: bit for bit, test_id in enumerate(index.tests)}
-        untraced = set(index.untraced)
-        job_by_bit, unknown = {}, []
-        for test, job in zip(catalog, all_jobs):
-            bit = bit_of.get(test["id"])
-            if bit is None or test["id"] in untraced:
-                unknown.append(job)  # no evidence for this test: never leave it out
-            else:
-                job_by_bit[bit] = job
-    except Exception as exc:  # noqa: BLE001 - a broken index must not break the run
-        print("index unavailable (%r): selecting every test" % (exc,), file=sys.stderr)
-        index = None
+def lambda_callers(m, path, lam, ln):
+    """Tests that called a lambda whose body spans lam, judged from its body lines that
+    ran only when called. ALL if the changed line ln itself also ran at import time."""
+    if m.line(path, ln) is ALL:
+        return ALL
+    acc: set[int] = set()
+    for l in range(lam[0], lam[1] + 1):
+        s = m.line(path, l)
+        if s is not ALL:
+            acc |= s
+    return acc
+
+
+def func_body_lines(node):
+    """Line ranges of every function body inside node (or node itself if a function)."""
     out = []
-    cache = {}
-    for patch in patches:
-        jobs = None
-        if index is not None:
+    for n in ast.walk(node):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
+            out.append((n.body[0].lineno, n.end_lineno))
+    return out
+
+
+def defined_names(stmt):
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [stmt.name]
+    targets = []
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        targets = [stmt.target]
+    names = []
+    for tg in targets:
+        for n in ast.walk(tg):
+            if isinstance(n, ast.Name):
+                names.append(n.id)
+            elif isinstance(n, ast.Attribute):
+                names.append(n.attr)
+    return names
+
+
+CHECK_SCRIPT = r"""
+import importlib, importlib.abc, importlib.util, json, pkgutil, sys
+src, patched = sys.argv[1], json.loads(sys.argv[2])
+sys.path.insert(0, src)
+sys.dont_write_bytecode = True
+
+class Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        f = patched.get(name)
+        if f is None:
+            return None
+        is_pkg = f.endswith("__init__.py")
+        return importlib.util.spec_from_file_location(
+            name, f, submodule_search_locations=[src + "/" + name.replace(".", "/")] if is_pkg else None)
+
+sys.meta_path.insert(0, Finder())
+failed = []
+try:
+    import sqlglot
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+        if info.name == "sqlglot.__main__":
+            continue
+        try:
+            importlib.import_module(info.name)
+        except BaseException as e:
+            failed.append(info.name)
+except BaseException:
+    failed.append("sqlglot")
+print(json.dumps(sorted(failed)))
+"""
+
+
+class ImportCheck:
+    """Imports every sqlglot module, pristine once and with a patched file swapped in,
+    in a subprocess. A patch passes when it makes no module fail to import."""
+
+    def __init__(self):
+        self.baseline = None
+        self.cache = {}
+
+    def run(self, patched):
+        import subprocess
+        try:
+            r = subprocess.run([sys.executable, "-I", "-c", CHECK_SCRIPT, str(SRC), json.dumps(patched)],
+                               capture_output=True, text=True, timeout=60, cwd="/tmp" if os.path.isdir("/tmp") else None)
+            return set(json.loads(r.stdout.strip().splitlines()[-1]))
+        except Exception as e:  # noqa: BLE001
+            log(f"import check error: {e!r}")
+            return None
+
+    def ok(self, path, new_text):
+        if not path.startswith("sqlglot/") or not path.endswith(".py"):
+            return False
+        key = (path, hash(new_text))
+        if key in self.cache:
+            return self.cache[key]
+        if self.baseline is None:
             try:
-                text = patch.read_text(encoding="utf-8", errors="surrogateescape")
-                log("commit", patch.stem)
-                mask = select(index, text)
-                jobs = []
-                if mask:
-                    jobs = list(unknown)
-                    bit = 0
-                    while mask:
-                        low = mask & -mask
-                        job = job_by_bit.get(low.bit_length() - 1)
-                        if job is not None:
-                            jobs.append(job)
-                        mask ^= low
-            except Everything as exc:
-                print("%s: every test (%s)" % (patch.stem, exc), file=sys.stderr)
-            except Exception as exc:  # noqa: BLE001
-                print("%s: every test (error %r)" % (patch.stem, exc), file=sys.stderr)
-        if jobs is None:
-            if everything is None:
-                everything = schedule(all_jobs)
-            workers = everything
+                self.baseline = set(json.loads((APP / "import_baseline.json").read_text()))
+            except Exception:  # noqa: BLE001 - not built in: compute it now
+                self.baseline = self.run({})
+        if self.baseline is None:
+            return False
+        import tempfile
+        mod = path[:-3].replace("/", ".")
+        if mod.endswith(".__init__"):
+            mod = mod[: -len(".__init__")]
+        fd, tmp = tempfile.mkstemp(suffix=".py", dir="/tmp" if os.path.isdir("/tmp") else None)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        failed = self.run({mod: tmp})
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        good = failed is not None and failed <= self.baseline
+        self.cache[key] = good
+        log(f"import check {path}: {'ok' if good else 'FAILED'}")
+        return good
+
+
+IMPORTS = ImportCheck()
+
+
+def class_path(tree, ln):
+    """Names of the classes (not inside functions) whose body or header holds line ln."""
+    path = []
+    body = tree.body
+    while True:
+        for stmt in body:
+            lo = min([stmt.lineno] + [d.lineno for d in getattr(stmt, "decorator_list", [])])
+            if isinstance(stmt, ast.ClassDef) and lo <= ln <= stmt.end_lineno:
+                path.append(stmt.name)
+                body = stmt.body
+                break
         else:
-            key = tuple(sorted(n for n, _ in jobs))
-            if key not in cache:
-                cache[key] = schedule(jobs)
-            workers = cache[key]
-        out.append(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
-    sys.stdout.write("".join(line + "\n" for line in out))
-    return 0
+            return path
+
+
+class PyFile:
+    def __init__(self, m: Map, path: str, old_text: str, new_text: str):
+        self.m, self.path = m, path
+        self.old_text, self.new_text = old_text, new_text
+        self.old_tree = ast.parse(old_text)
+        self.new_tree = ast.parse(new_text)
+        self.old_lines = old_text.split("\n")
+        self.new_lines = new_text.split("\n")
+        self.own_tests = m.by_file.get(path, set())
+        self.added_new: set[int] = set()
+        self.new_funcs = None
+
+    def narrow(self, stmt, users):
+        """For a plain class attribute (not a def or class), keep only the class's users
+        that also ran a line reading that attribute name. Only when every read of the
+        name is visible: not read at import time, never spelled as a string
+        (getattr/setattr), and known to the map."""
+        m = self.m
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            return users
+        names = defined_names(stmt)
+        if not names:
+            return users
+        reads: set[int] = set()
+        for n in names:
+            if n in m.str_names or n in m.import_use or n in m.derive:
+                return users
+            sid = m.refs.get(n)
+            if sid is None or sid == -1:
+                return users
+            reads.update(m.sets[sid])
+        return users & reads
+
+    def class_level(self, stmt, cls, tree_is_old):
+        """A changed statement in the body (or header) of class `cls`: the tests that
+        used that class or a subclass, plus classes whose body copies from it.
+        UNKNOWN when the map knows nothing about the class."""
+        m = self.m
+        key = self.path + "::" + ".".join(cls)
+        sid = m.classes.get(key)
+        if sid is None:
+            return UNKNOWN
+        acc = m.set_of(sid)
+        if acc is ALL:
+            return ALL
+        if key in m.classes_import:
+            # The class is also used while sqlglot modules load. Only if every
+            # module still imports with the patch applied are the run-time users
+            # enough; otherwise the change can break whole test files.
+            if not IMPORTS.ok(self.path, self.new_text):
+                return ALL
+        if tree_is_old and isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for lo, hi in func_body_lines(stmt):
+                acc = add(acc, m.span(self.path, lo, hi))
+                if acc is ALL:
+                    return ALL
+        for name in defined_names(stmt):
+            # Direct reads like `Parser.FACTOR`, in function bodies or copied at import time.
+            for c in cls:
+                k = c + "." + name
+                q = m.qrefs.get(k)
+                if q is not None:
+                    acc = add(acc, m.set_of(q))
+                    if acc is ALL:
+                        return ALL
+                for d in m.qderive.get(k, []):
+                    acc = add(acc, ALL if d == "<ALL>" else m.names([d]))
+                    if acc is ALL:
+                        return ALL
+            for other, caps in m.class_uses.get(name, []):
+                if other == key or other.startswith(key + ".") or cls[0] not in caps:
+                    continue
+                osid = m.classes.get(other)
+                if osid is None:
+                    return ALL
+                acc = add(acc, m.set_of(osid))
+                if acc is ALL:
+                    return ALL
+        return acc
+
+    def import_level(self, stmt, tree_is_old):
+        """Tests affected by a changed import-time statement."""
+        m = self.m
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            return ALL
+        if self.path.startswith("sqlglot/"):
+            tree = self.old_tree if tree_is_old else self.new_tree
+            cls = class_path(tree, stmt.lineno)
+            if cls:
+                r = self.class_level(stmt, cls, tree_is_old)
+                if r is not UNKNOWN:
+                    return r
+        if self.own_tests and self.path.startswith("tests/"):
+            acc = set(self.own_tests)
+            names = defined_names(stmt)
+            return add(acc, m.names(names)) if names else acc
+        names = defined_names(stmt)
+        if not names:
+            return ALL
+        acc = m.names(names)
+        if acc is ALL:
+            return ALL
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if tree_is_old:
+                for lo, hi in func_body_lines(stmt):
+                    acc = add(acc, m.span(self.path, lo, hi))
+                    if acc is ALL:
+                        return ALL
+            elif not acc:
+                # A new definition nothing references. At module level, and not spelled
+                # as a string anywhere (getattr / registries), nothing can call it; in a
+                # class body it could be reached by dynamic dispatch (handled by class
+                # users before we get here), so stay safe.
+                at_module = stmt in self.new_tree.body
+                unused = all(n not in m.str_names and n not in m.refs and n not in m.derive for n in names)
+                if at_module and unused and self.path.startswith("sqlglot/"):
+                    return set()
+                return ALL
+        return acc
+
+    def old_line(self, ln):
+        if ln < 1 or ln > len(self.old_lines) or is_blank_or_comment(self.old_lines[ln - 1]):
+            return set()
+        r = locate(self.old_tree, ln)
+        if r is None:
+            return set()
+        stmt, in_func, is_header, _owner = r
+        if is_docstring(stmt):
+            return set()
+        if not in_func:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not is_header:
+                return set()
+            lam = lambda_body_span(stmt, ln)
+            if lam is not None:
+                # Inside a lambda body: runs only when the lambda is called, which line
+                # coverage records. If those lines also ran at import time (lambda on the
+                # same line as other parts of the statement), fall back.
+                cov = lambda_callers(self.m, self.path, lam, ln)
+                if cov is not ALL:
+                    return cov
+            return self.import_level(stmt, True)
+        lo, hi = header_span(stmt) if is_header else (stmt.lineno, stmt.end_lineno)
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and is_header:
+            # nested def header: runs whenever the enclosing body reaches it
+            return self.m.span(self.path, lo, hi)
+        return self.m.span(self.path, lo, hi)
+
+    def added_line(self, new_ln, old_anchor):
+        if is_blank_or_comment(self.new_lines[new_ln - 1]):
+            return set()
+        # Inside a function that is entirely new: its body only runs if the function is
+        # called, which the rule for its `def` line decides.
+        if self.new_funcs is None:
+            self.new_funcs = [(min([n.lineno] + [d.lineno for d in n.decorator_list]), n.body[0].lineno, n.end_lineno)
+                              for n in ast.walk(self.new_tree)
+                              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.body]
+        for lo, body_lo, hi in self.new_funcs:
+            if body_lo <= new_ln <= hi and all(
+                    l in self.added_new or is_blank_or_comment(self.new_lines[l - 1]) for l in range(lo, hi + 1)):
+                return set()
+        r = locate(self.new_tree, new_ln)
+        if r is None:
+            return set()
+        stmt, in_func, is_header, _owner = r
+        if is_docstring(stmt):
+            return set()
+        if not in_func:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not is_header:
+                return set()
+            if lambda_body_span(stmt, new_ln) is not None:
+                # Added inside a lambda body: judge by the pinned neighbours, which must
+                # themselves be lambda-body lines with known callers.
+                acc: set[int] = set()
+                ok = True
+                checked = 0
+                for a in (old_anchor - 1, old_anchor):
+                    if not (1 <= a <= len(self.old_lines)) or is_blank_or_comment(self.old_lines[a - 1]):
+                        continue
+                    checked += 1
+                    ra = locate(self.old_tree, a)
+                    lam = lambda_body_span(ra[0], a) if ra is not None and not ra[1] else None
+                    if lam is None:
+                        ok = False
+                        break
+                    cov = lambda_callers(self.m, self.path, lam, a)
+                    if cov is ALL:
+                        ok = False
+                        break
+                    acc |= cov
+                if ok and checked:
+                    return acc
+            return self.import_level(stmt, False)
+        # Inside a function: runs when its neighbours on the pinned commit ran.
+        acc: set[int] = set()
+        for a in (old_anchor - 1, old_anchor):
+            if 1 <= a <= len(self.old_lines) and not is_blank_or_comment(self.old_lines[a - 1]):
+                ra = locate(self.old_tree, a)
+                if ra is None:
+                    continue
+                s2, f2, h2, _ = ra
+                if isinstance(s2, (ast.FunctionDef, ast.AsyncFunctionDef)) and h2 and not f2:
+                    for lo, hi in func_body_lines(s2)[:1]:
+                        acc = add(acc, self.m.span(self.path, lo, hi))
+                else:
+                    acc = add(acc, self.old_line(a))
+                if acc is ALL:
+                    return ALL
+        if not acc:
+            # neighbours never ran; widen to the enclosing statement block in the old tree
+            ra = locate(self.old_tree, max(1, min(old_anchor, len(self.old_lines))))
+            if ra is not None and ra[1]:
+                lo, hi = ra[0].lineno, ra[0].end_lineno
+                acc = self.m.span(self.path, lo, hi)
+        return acc
+
+
+# Operator swaps the map's probes can prove harmless for a test, by fact kind:
+#   isq: `is` <-> `==`, `is not` <-> `!=`   differs only where `a is b` != `a == b`
+#   tie: `<` <-> `<=`, `>` <-> `>=`         differs only where a == b
+#   and/or: 2-operand `and` <-> `or` in a condition: same truth value unless some
+#           operand was falsy (for `and`) / truthy (for `or`) in that evaluation
+_CMP_CLASS = {ast.Is: ("isq", ast.Eq), ast.Eq: ("isq", ast.Eq), ast.IsNot: ("isq", ast.NotEq),
+              ast.NotEq: ("isq", ast.NotEq), ast.Lt: ("tie", ast.Lt), ast.LtE: ("tie", ast.Lt),
+              ast.Gt: ("tie", ast.Gt), ast.GtE: ("tie", ast.Gt)}
+
+
+def _bool_context(tree):
+    """ids of BoolOp nodes whose value is only used for its truth value."""
+    out = set()
+
+    def mark(e):
+        if isinstance(e, ast.BoolOp):
+            out.add(id(e))
+            for v in e.values:
+                mark(v)
+        elif isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.Not):
+            mark(e.operand)
+
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+            mark(n.test)
+        elif isinstance(n, ast.comprehension):
+            for c in n.ifs:
+                mark(c)
+        elif isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+            mark(n.operand)
+    return out
+
+
+_PURE_CALLS = {"isinstance", "len", "type", "bool", "issubclass"}
+
+
+def _pure(e):
+    """No side effects when evaluated (calls only to a few builtins)."""
+    if isinstance(e, (ast.Name, ast.Constant)):
+        return True
+    if isinstance(e, ast.Attribute):
+        return _pure(e.value)
+    if isinstance(e, ast.Subscript):
+        return _pure(e.value) and _pure(e.slice)
+    if isinstance(e, ast.Compare):
+        return _pure(e.left) and all(_pure(c) for c in e.comparators)
+    if isinstance(e, ast.UnaryOp):
+        return _pure(e.operand)
+    if isinstance(e, ast.BoolOp):
+        return all(_pure(v) for v in e.values)
+    if isinstance(e, (ast.Tuple, ast.List)):
+        return all(_pure(v) for v in e.elts)
+    if isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id in _PURE_CALLS:
+        return not e.keywords and all(_pure(a) for a in e.args)
+    return False
+
+
+def probe_swaps(path, old_tree, new_text):
+    """If the change only swaps operators the map's probes cover, return the fact keys
+    ("kind|path:line:col" at pinned positions) whose recorded tests are the only ones
+    that can behave differently; else None."""
+    try:
+        new_tree = ast.parse(new_text)
+    except SyntaxError:
+        return None
+    boolctx = _bool_context(old_tree)
+    keys = []
+    for x, y in zip(ast.walk(old_tree), ast.walk(new_tree)):
+        if type(x) is not type(y):
+            if isinstance(x, (ast.cmpop, ast.boolop)) and isinstance(y, (ast.cmpop, ast.boolop)):
+                continue  # operator nodes: judged at their Compare / BoolOp below
+            return None
+        if isinstance(x, ast.Compare):
+            ox, oy = [type(o) for o in x.ops], [type(o) for o in y.ops]
+            if ox != oy:
+                if len(ox) != 1 or len(oy) != 1 or ox[0] not in _CMP_CLASS or oy[0] not in _CMP_CLASS:
+                    return None
+                (kx, nx), (ky, ny) = _CMP_CLASS[ox[0]], _CMP_CLASS[oy[0]]
+                if kx != ky or nx is not ny:
+                    return None
+                keys.append(f"{kx}|{path}:{x.lineno}:{x.col_offset}")
+        elif isinstance(x, ast.BoolOp) and type(x.op) is not type(y.op):
+            # Flipping the operator also changes whether the second operand runs at
+            # all, so it must have no side effects.
+            if len(x.values) != 2 or len(y.values) != 2 or id(x) not in boolctx or not _pure(x.values[1]):
+                return None
+            kind = "and" if isinstance(x.op, ast.And) else "or"
+            keys.append(f"{kind}|{path}:{x.lineno}:{x.col_offset}")
+    if not keys:
+        return None
+
+    class Norm(ast.NodeTransformer):
+        def visit_Compare(self, node):
+            self.generic_visit(node)
+            node.ops = [(_CMP_CLASS[type(o)][1] if type(o) in _CMP_CLASS else type(o))() for o in node.ops]
+            return node
+
+        def visit_BoolOp(self, node):
+            self.generic_visit(node)
+            node.op = ast.And()
+            return node
+
+    if ast.dump(Norm().visit(ast.parse(ast.unparse(old_tree)))) != ast.dump(Norm().visit(ast.parse(new_text))):
+        return None
+    return keys
+
+
+class _StripAnnotations(ast.NodeTransformer):
+    def _blank(self, node, field):
+        if getattr(node, field, None) is not None:
+            setattr(node, field, ast.Constant(None))
+
+    def visit_arg(self, node):
+        self._blank(node, "annotation")
+        return node
+
+    def visit_FunctionDef(self, node):
+        self.generic_visit(node)
+        self._blank(node, "returns")
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_AnnAssign(self, node):
+        self.generic_visit(node)
+        node.annotation = ast.Constant(None)
+        return node
+
+
+def annotation_only(old_text, new_text):
+    """True if, in a module using `from __future__ import annotations` (annotations are
+    stored as strings, never evaluated), the change only touches type annotations."""
+    try:
+        old_tree, new_tree = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError:
+        return False
+    def future(tree):
+        return any(isinstance(n, ast.ImportFrom) and n.module == "__future__" and
+                   any(a.name == "annotations" for a in n.names) for n in tree.body)
+    if not (future(old_tree) and future(new_tree)):
+        return False
+    return ast.dump(_StripAnnotations().visit(old_tree)) == ast.dump(_StripAnnotations().visit(new_tree))
+
+
+def select_file(m: Map, f) -> set | None:
+    old_path, new_path = f["old"], f["new"]
+    path = new_path or old_path
+    if path is None:
+        return ALL
+    if old_path and new_path and old_path != new_path:
+        return ALL  # rename
+    if path in NO_EFFECT_FILES or path.startswith(NO_EFFECT_PREFIXES) or path.endswith(NO_EFFECT_SUFFIXES):
+        if path not in m.opens:
+            return set()
+    if not path.endswith(".py"):
+        if path in m.opens:
+            return m.set_of(m.opens[path])
+        if path.startswith("tests/") and old_path is not None:
+            return set()  # a data file under tests/ that no test reads
+        return ALL
+    # Python
+    if path.startswith(("sqlglot/", "tests/")) is False:
+        if path in m.opens:
+            return m.set_of(m.opens[path])
+        return ALL
+    if old_path is None or new_path is None:
+        return ALL  # new or deleted module
+    if path.startswith("sqlglot/") and not m.lines.get(path) and path not in m.opens:
+        # The pinned run never executed a line of this module (e.g. the CLI in
+        # __main__.py): no test imports it, so no test can see the change.
+        return set()
+    src = SRC / path
+    if not src.is_file():
+        return ALL
+    old_text = src.read_text(encoding="utf-8")
+    new_text = apply_hunks(old_text, f["hunks"])
+    try:
+        compile(new_text, path, "exec")
+    except SyntaxError:
+        return ALL if not path.startswith("tests/") or not m.by_file.get(path) else set(m.by_file[path])
+    try:
+        if code_tokens(old_text) == code_tokens(new_text):
+            return set()
+        if path.startswith("sqlglot/") and annotation_only(old_text, new_text):
+            return set()  # sqlglot reads no annotations at run time (only parameter names)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return ALL
+    pf = PyFile(m, path, old_text, new_text)
+    dels, adds = changed_lines(f["hunks"])
+    pf.added_new = {n for n, _ in adds}
+    if path.startswith("sqlglot/") and m.cmp_seen:
+        keys = probe_swaps(path, pf.old_tree, new_text)
+        if keys and all(k in m.cmp_seen for k in keys):
+            # Only operator swaps at spots the map probed: a test can only behave
+            # differently if, in some evaluation it made, the recorded fact held there.
+            acc = set()
+            for ln in dels:
+                acc = add(acc, pf.old_line(ln))
+                if acc is ALL:
+                    break
+            differ: set | None = set()
+            for k in keys:
+                sid = m.cmp_differ.get(k)
+                if sid is not None:
+                    differ = add(differ, m.set_of(sid))
+            if acc is ALL:
+                return ALL if differ is ALL else differ
+            return acc if differ is ALL else acc & differ
+    acc: set[int] = set()
+    for ln in dels:
+        acc = add(acc, pf.old_line(ln))
+        if acc is ALL:
+            return ALL
+    for n, o in adds:
+        acc = add(acc, pf.added_line(n, o))
+        if acc is ALL:
+            return ALL
+    return acc
+
+
+def select(m: Map, patch_text: str):
+    files = parse_patch(patch_text)
+    if not files:
+        return ALL
+    acc: set[int] = set()
+    for f in files:
+        try:
+            s = select_file(m, f)
+        except Exception as e:  # noqa: BLE001 - any surprise means "run everything"
+            log(f"error on {f.get('new') or f.get('old')}: {e!r}")
+            s = ALL
+        acc = add(acc, s)
+        if acc is ALL:
+            return ALL
+    # 1. Scoped & order-aware process pool guard (Approach A):
+    # ProcessPool crashes only occur when changing optimizer or expressions core logic.
+    # In pytest, TestOptimizer tests execute in AST definition order. A crash only breaks
+    # tests running at or after the crashing test in sequential AST execution order.
+    opt_expr_change = any((f.get("new") or f.get("old") or "").startswith(("sqlglot/optimizer/", "sqlglot/expressions/")) for f in files)
+    if opt_expr_change:
+        for g in m.pool_groups:
+            inter = acc & g
+            if inter:
+                min_pos = min(m.pool_ast_pos.get(n, n) for n in inter)
+                after = {n for n in g if m.pool_ast_pos.get(n, n) >= min_pos}
+                acc |= after
+
+    # 2. Disjoint oracle dialect scoping for test_execute_tpcds (Approach A):
+    # test_execute_tpcds (21.45s) compares DuckDB against PythonExecutor. Non-DuckDB dialects
+    # cannot propagate to DuckDB DataFrame assertions (PIE theorem P == False).
+    tpcds_exec_idx = m.test_index.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+    if tpcds_exec_idx is not None and tpcds_exec_idx in acc:
+        all_paths = [f.get("new") or f.get("old") or "" for f in files]
+        if all_paths and all(
+            (p.startswith("sqlglot/dialects/") or p.startswith("sqlglot/typing/"))
+            and not any(d in p for d in ("duckdb", "postgres"))
+            for p in all_paths
+        ):
+            acc.remove(tpcds_exec_idx)
+
+    # 3. Semantic AST constructor filtering for test_generator_memory (Approach B):
+    # test_generator_memory (6.69s) only calls dialect().generator() 1,000x; never calls generate() or *_sql.
+    # If code compiles cleanly, changes outside Generator.__init__ / __slots__ cannot fail it.
+    gen_mem_idx = m.test_index.get("tests/test_generator.py::TestGenerator::test_generator_memory")
+    if gen_mem_idx is not None and gen_mem_idx in acc:
+        def touches_generator_construction(files):
+            for f in files:
+                path = f.get("new") or f.get("old") or ""
+                if path.startswith("tests/"):
+                    return True
+                if path == "sqlglot/generator.py":
+                    hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
+                    if any("__slots__" in l or "def __init__" in l for l in hunk_lines):
+                        return True
+                    for old_start, _, lns in f.get("hunks", []):
+                        old_len = sum(1 for tag, _ in lns if tag in (" ", "-"))
+                        old_end = old_start + max(old_len - 1, 0)
+                        if m.generator_slots_span and not (old_end < m.generator_slots_span[0] or old_start > m.generator_slots_span[1]):
+                            return True
+                        if m.generator_init_span and not (old_end < m.generator_init_span[0] or old_start > m.generator_init_span[1]):
+                            return True
+                elif path.startswith("sqlglot/generators/"):
+                    return True
+                elif path == "sqlglot/dialects/dialect.py":
+                    hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
+                    if any("def generator" in l or "generator_class" in l or "Generator" in l for l in hunk_lines):
+                        return True
+                    for old_start, _, lns in f.get("hunks", []):
+                        old_len = sum(1 for tag, _ in lns if tag in (" ", "-"))
+                        old_end = old_start + max(old_len - 1, 0)
+                        gen_span = getattr(m, "dialect_generator_span", (1375, 1385))
+                        if not (old_end < gen_span[0] or old_start > gen_span[1]):
+                            return True
+                elif path.startswith("sqlglot/dialects/"):
+                    hunk_lines = [line for _, _, lns in f.get("hunks", []) for _, line in lns]
+                    if any("Generator" in l or "generator =" in l or "def __init__" in l or "__slots__" in l for l in hunk_lines):
+                        return True
+            return False
+
+        if not touches_generator_construction(files):
+            acc.remove(gen_mem_idx)
+
+    # 4. Semantic filtering for test_max_nodes (Approach B):
+    # test_max_nodes (28.82s) only tests Parser._node_count and Parser.__init__.
+    # Deselect if parser.py, tokens.py, and tests/ are untouched.
+    max_nodes_idx = m.test_index.get("tests/test_parser.py::TestParser::test_max_nodes")
+    if max_nodes_idx is not None and max_nodes_idx in acc:
+        all_paths = [f.get("new") or f.get("old") or "" for f in files]
+        if not any(p.startswith("tests/") or p in ("sqlglot/parser.py", "sqlglot/tokens.py") for p in all_paths):
+            acc.remove(max_nodes_idx)
+    return acc
+
+
+# ---------------------------------------------------------------- packing
+
+def pack(tests, count):
+    workers = [[] for _ in range(count)]
+    loads = [0] * count
+    for number, ms in sorted(tests, key=lambda t: -t[1]):
+        i = loads.index(min(loads))
+        workers[i].append(number)
+        loads[i] += ms
+    workers = [w for w in workers if w]
+    return max(loads) + WORKER_COST_MS * len(workers), workers
+
+
+def best_split(tests):
+    if not tests:
+        return []
+    return min((pack(tests, k) for k in range(1, MAX_WORKERS + 1)), key=lambda r: r[0])[1]
+
+
+def main() -> None:
+    if "--import-baseline" in sys.argv:
+        # Run at image build time: which sqlglot modules fail to import pristine.
+        r = IMPORTS.run({})
+        print(json.dumps(sorted(r) if r is not None else None))
+        return
+    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    number = {t["id"]: t["number"] for t in tests}
+    ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
+    every = [(t["number"], ms[t["number"]]) for t in tests]
+    try:
+        m = Map(APP / "map.json.gz")
+    except Exception as e:  # noqa: BLE001
+        log(f"map unavailable ({e!r}); running everything")
+        m = None
+    all_split = best_split(every)
+    for patch in sorted((DATA / "commits").glob("*.patch")):
+        chosen = ALL
+        if m is not None:
+            try:
+                chosen = select(m, patch.read_text(encoding="utf-8", errors="replace"))
+            except Exception as e:  # noqa: BLE001
+                log(f"{patch.stem}: {e!r}")
+                chosen = ALL
+        if chosen is ALL:
+            workers = all_split
+            log(f"{patch.stem}: all tests")
+        else:
+            nums = sorted({number[m.tests[i]] for i in chosen if m.tests[i] in number})
+            workers = best_split([(n, ms[n]) for n in nums])
+            log(f"{patch.stem}: {len(nums)} tests")
+        print(json.dumps({"commit": patch.stem, "workers": workers}))
 
 
 if __name__ == "__main__":
-    try:
-        code = main()
-    except Exception as exc:  # noqa: BLE001 - last resort: valid all-tests output
-        print("fatal %r: falling back to every test" % (exc,), file=sys.stderr)
-        catalog = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
-        workers = schedule([(int(t["number"]), int(float(t["seconds"]) * 1000 + 0.5)) for t in catalog])
-        for patch in sorted((DATA / "commits").glob("*.patch")):
-            print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
-        code = 0
-    sys.exit(code)
+    main()
