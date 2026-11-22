@@ -58,8 +58,12 @@ the selector itself uses about 0.2 s of CPU for the 30 sample commits):
 | this selector with `BLAST_CLASS_NARROWING=1` | 179.7 s | 0 |
 
 Class narrowing is off by default until it has been checked on more self-made mutants.
-On our own mutated commits (random one-line edits of code, fixtures and tests, labelled by
-running the full suite on each) the shipped configuration missed none of the first 102.
+
+On 240 of our own mutated commits (random one-line edits: 180 code, 30 fixture, 30 test;
+labelled by running the full suite on each) the shipped index misses none, with class
+narrowing off (12.5 s per commit) or on (10.0 s per commit). The first version of the tracer
+did miss one: CPython reports no line event for a function's own first line, so one-line
+lambdas looked unused. The tracer now records function entry as well.
 
 ## Reproduce
 
