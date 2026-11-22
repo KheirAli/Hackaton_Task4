@@ -4,7 +4,8 @@
   mutants.py gen   SQLGLOT_ROOT OUT_DIR COUNT SEED [KINDS]   write OUT_DIR/commits/*.patch
   mutants.py label SQLGLOT_ROOT TESTS_JSON OUT_DIR [JOBS]    run pytest per patch, write answers.json
 
-KINDS is a comma list from: code, class, fixture, test (default "code").
+KINDS is a comma list from: code, class, const, cmp, cmpsafe, fixture, test (default "code").
+"const" restricts code edits to module-level assignments.
 "class" restricts code edits to statements that sit directly in a class body.
 "cmp" swaps the operator of a comparison inside a function for another one;
 "cmpsafe" only swaps is/==, is not/!=, </<=, >/>=.
@@ -65,6 +66,11 @@ def gen(root, out, count, seed, kinds):
                 for stmt in node.body:
                     if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                         weighted["class"].extend((name, i) for i in range(stmt.lineno - 1, stmt.end_lineno))
+    weighted["const"] = []  # module-level `NAME = value` statements
+    for name in pools["code"]:
+        for stmt in ast.parse("\n".join(lines_of[name])).body:
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                weighted["const"].extend((name, i) for i in range(stmt.lineno - 1, stmt.end_lineno))
     # "cmp": swap the operator of a single-operator comparison inside a function.
     cmp_ops = {"Is": "is", "IsNot": "is not", "Eq": "==", "NotEq": "!=", "Lt": "<", "LtE": "<=", "Gt": ">", "GtE": ">="}
     cmp_sites = []
@@ -173,8 +179,10 @@ def label(root, tests_json, out, jobs):
                 shutil.copy(src, copy)
         patch = os.path.abspath(os.path.join(out, "commits", cid + ".patch"))
         applied = subprocess.run(["patch", "-p1", "-s", "-i", patch], cwd=copy, capture_output=True, text=True)
-        if applied.returncode:
-            raise RuntimeError("patch failed for %s: %s" % (cid, applied.stdout + applied.stderr))
+        if applied.returncode:  # touches a file outside the copied tree (docs, CI): nothing to run
+            json.dump({"error": "patch does not apply to the test tree", "failing": []}, open(done, "w"))
+            shutil.rmtree(copy, ignore_errors=True)
+            return
         report = os.path.join(copy, "report.json")
         mine = cpus[(slot * per) % len(cpus):][:per]
         env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", BLAST_REPORT=report,

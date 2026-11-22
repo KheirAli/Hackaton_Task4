@@ -78,7 +78,35 @@ def _install():
             used_types.add(type(obj))
         return None
 
+    lists = set()
+
     def audit(event, args):
+        if event == "os.listdir" or event == "os.scandir":
+            # Which directories did the test enumerate itself (not the import system)?
+            # A file ADDED to such a directory can reach the test.
+            path = args[0] if args else None
+            if path is None:
+                path = "."
+            if isinstance(path, bytes):
+                try:
+                    path = path.decode()
+                except UnicodeDecodeError:
+                    return
+            if not isinstance(path, str):
+                return
+            try:
+                full = realpath(path) + os.sep
+            except Exception:
+                return
+            if not full.startswith(root):
+                return
+            frame = sys._getframe(1)
+            while frame is not None:
+                if frame.f_code.co_filename.startswith("<frozen importlib"):
+                    return
+                frame = frame.f_back
+            lists.add(full[len(root):].rstrip(os.sep))
+            return
         if event != "open":
             return
         path = args[0]
@@ -191,7 +219,7 @@ def _install():
         importlib.machinery.SourceFileLoader.get_code = get_code
 
     def dump():
-        out = {"imp": {}, "fn": {}, "opens": sorted(opens)}
+        out = {"imp": {}, "fn": {}, "opens": sorted(opens), "lists": sorted(lists)}
         classes = set()
         for used in list(used_types):
             for klass in getattr(used, "__mro__", ()):

@@ -42,19 +42,20 @@ def run(test):
                        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3600)
     finally:
         slots.put(pair)
-    record = {"id": test["id"], "outcome": "error", "detail": "", "imp": {}, "fn": {}, "opens": [], "classes": [], "procs": 0}
+    record = {"id": test["id"], "outcome": "error", "detail": "", "imp": {}, "fn": {}, "opens": [], "classes": [], "lists": [], "procs": 0}
     try:
         text = open(prefix + ".outcome").read()
         record["outcome"], _, record["detail"] = text.partition("\n")
         os.remove(prefix + ".outcome")
     except OSError:
         pass
-    opens, classes = set(), set()
+    opens, classes, lists = set(), set(), set()
     for part in glob.glob(prefix + ".*.json"):
         data = json.load(open(part))
         record["procs"] += 1
         opens.update(data["opens"])
         classes.update(data.get("classes", ()))
+        lists.update(data.get("lists", ()))
         for key in ("imp", "fn"):
             for name, lines in data[key].items():
                 record[key].setdefault(name, set()).update(lines)
@@ -65,6 +66,7 @@ def run(test):
         os.remove(part)
     record["opens"] = sorted(opens)
     record["classes"] = sorted(classes)
+    record["lists"] = sorted(lists)
     for key in ("imp", "fn"):
         record[key] = {name: sorted(lines) for name, lines in record[key].items()}
     with open(out + ".tmp", "w") as handle:
@@ -85,6 +87,7 @@ for part in sorted(glob.glob(os.path.join(raw, "part*.*.json"))):
     record["procs"] += 1
     record["opens"] = sorted(set(record["opens"]) | set(data["opens"]))
     record["classes"] = sorted(set(record.get("classes", ())) | set(data.get("classes", ())))
+    record["lists"] = sorted(set(record.get("lists", ())) | set(data.get("lists", ())))
     for key in ("imp", "fn"):
         for name, lines in data[key].items():
             record[key][name] = sorted(set(record[key].get(name, ())) | set(lines))

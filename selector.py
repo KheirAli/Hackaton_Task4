@@ -34,6 +34,7 @@ DATA = Path(os.environ.get("BLAST_DATA", "/data"))
 INDEX = Path(os.environ.get("BLAST_INDEX", Path(__file__).resolve().parent / "blast_index.zip"))
 DEBUG = os.environ.get("BLAST_DEBUG") == "1"
 CLASS_NARROWING = os.environ.get("BLAST_CLASS_NARROWING", "1") == "1"
+CONST_NARROWING = os.environ.get("BLAST_CONST_NARROWING", "1") == "1"
 CMP_PROFILE = os.environ.get("BLAST_CMP_PROFILE", "1") == "1"
 # Operator swaps whose outcome on given operands is stable from run to run: identity
 # against equality, and a strict bound against its inclusive form (they differ only
@@ -45,8 +46,13 @@ EAGER_SHARE = float(os.environ.get("BLAST_EAGER_SHARE", "0.9"))
 MAX_WORKERS = 8
 WORKER_OVERHEAD_MS = 2000
 FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef)
-# Files whose change can alter how the whole suite is collected or configured.
-GLOBAL_FILES = {"conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", "setup.py"}
+# Files that change how the whole suite is collected or how every process starts.
+GLOBAL_FILES = {"conftest.py", "pytest.ini", ".pytest.ini", "tox.ini", "sitecustomize.py", "usercustomize.py"}
+# Files that can carry pytest configuration; they matter only if the patch adds some.
+CONFIG_FILES = {"setup.cfg", "pyproject.toml"}
+# Module-level names that test runners call without anyone mentioning them.
+HOOK_NAMES = {"setUpModule", "tearDownModule", "setup_module", "teardown_module", "setup_function",
+              "teardown_function", "load_tests", "conftest"}
 
 
 class Everything(Exception):
@@ -70,6 +76,9 @@ class Index:
         self.files = set(meta["files"])
         self.cov_names = set(meta["cov"])
         self.untraced = meta.get("untraced", [])
+        self.lists = meta.get("lists")
+        self.no_lists = meta.get("no_lists", "0")
+        self._all_src = None
         self._cov = {}
         self._src = {}
         self._tree = {}
@@ -86,9 +95,10 @@ class Index:
                     "lines": {int(k): sets[v] for k, v in raw["lines"].items()},
                     "classes": [(lo, hi, int(m, 16)) for lo, hi, m in raw.get("classes", ())],
                     "cmp": raw.get("cmp", {}),
+                    "consts": raw.get("consts", {}),
                 }
             else:
-                entry = {"importers": 0, "implines": [], "lines": {}, "classes": [], "cmp": {}}
+                entry = {"importers": 0, "implines": [], "lines": {}, "classes": [], "cmp": {}, "consts": {}}
             self._cov[name] = entry
         return self._cov[name]
 
@@ -104,6 +114,20 @@ class Index:
         if name not in self._tree:
             self._tree[name] = ast.parse(self.src(name))
         return self._tree[name]
+
+    def listers(self, directory):
+        """Tests that enumerated a directory themselves, or None if the index has no such record."""
+        if self.lists is None:
+            return None
+        return int(self.lists.get(directory, self.no_lists), 16)
+
+    def identifier_used(self, word):
+        """Does the word occur anywhere in the base Python sources (code, strings, comments)?"""
+        if self._all_src is None:
+            self._all_src = "\n".join(
+                self.zip.read(item).decode("utf-8", "replace") for item in self.zip.namelist() if item.startswith("src/")
+            )
+        return re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(word), self._all_src) is not None
 
     def openers(self, name):
         return int(self.opens.get(name, "0"), 16)
@@ -157,6 +181,11 @@ class Index:
         if not any(lo <= line <= hi for line in entry["implines"]):
             return 0
         importers = entry["importers"]
+        users = entry["consts"].get("%d-%d" % (lo, hi)) if CONST_NARROWING else None
+        if users is not None:
+            # `NAME = value` at module level, with NAME only ever mentioned inside
+            # functions: the new value reaches a test only through such a line.
+            return int(users, 16) & importers
         if CLASS_NARROWING and bin(importers).count("1") >= EAGER_SHARE * len(self.tests):
             for c_lo, c_hi, users in entry["classes"]:
                 if c_lo < lo and hi <= c_hi and (lo, hi) != (c_lo, c_hi):
@@ -318,10 +347,78 @@ def _touches(node, ranges):
     return False
 
 
-def diff_trees(old, new, old_ranges, new_ranges):
+def _future_annotations(tree):
+    return any(
+        isinstance(node, ast.ImportFrom) and node.module == "__future__" and any(a.name == "annotations" for a in node.names)
+        for node in tree.body
+    )
+
+
+def _signature(args, keep_annotations):
+    """Dump of a function's parameters, optionally ignoring annotations."""
+    if keep_annotations:
+        return ast.dump(args)
+    names = [[a.arg for a in group] for group in (args.posonlyargs, args.args, args.kwonlyargs)]
+    return repr((names, args.vararg and args.vararg.arg, args.kwarg and args.kwarg.arg,
+                 _dump(args.defaults), _dump(args.kw_defaults)))
+
+
+def _literal(node):
+    """A value that cannot fail or have an effect when evaluated."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_literal(item) for item in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(key is not None and _literal(key) for key in node.keys) and all(_literal(v) for v in node.values)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float))
+    return False
+
+
+def _inert_definition(stmt, annotations_lazy):
+    """Names bound by a module-level statement that does nothing but bind them, else None."""
+    if isinstance(stmt, FUNCS):
+        if stmt.decorator_list or getattr(stmt, "type_params", None):
+            return None
+        args = stmt.args
+        if not all(_literal(d) for d in args.defaults + [d for d in args.kw_defaults if d is not None]):
+            return None
+        annotated = stmt.returns is not None or any(
+            a.annotation is not None
+            for a in args.posonlyargs + args.args + args.kwonlyargs + [x for x in (args.vararg, args.kwarg) if x]
+        )
+        if annotated and not annotations_lazy:
+            return None
+        return [stmt.name]
+    if isinstance(stmt, ast.Assign):
+        if all(isinstance(t, ast.Name) for t in stmt.targets) and _literal(stmt.value):
+            return [t.id for t in stmt.targets]
+        return None
+    if isinstance(stmt, ast.AnnAssign):
+        if isinstance(stmt.target, ast.Name) and stmt.value is not None and _literal(stmt.value) and annotations_lazy:
+            return [stmt.target.id]
+    return None
+
+
+def diff_trees(old, new, old_ranges, new_ranges, unused_name=None):
     """Regions of the OLD tree that differ: (kind, lo, hi) with kind 'fn' or 'imp',
     or ('cmp', lo, hi, "line:col", NewOperatorName) for an operator-only comparison edit."""
     regions = []
+    lazy = _future_annotations(old) and _future_annotations(new)
+
+    def harmless_insert(statements):
+        """New module-level definitions of names nobody mentions cannot change any test."""
+        if unused_name is None:
+            return False
+        for stmt in statements:
+            names = _inert_definition(stmt, lazy)
+            if not names:
+                return False
+            for name in names:
+                if name.startswith("__") or name.startswith("pytest_") or name in HOOK_NAMES or not unused_name(name):
+                    return False
+        return True
 
     def report(node, fn, stmt):
         if fn is None:
@@ -373,7 +470,9 @@ def diff_trees(old, new, old_ranges, new_ranges):
         for gone in la[head:len(la) - tail]:
             report(gone, fn, gone)
         if len(lb) - tail > head:  # statements were inserted
-            if isinstance(fn, FUNCS):
+            if fn is None and isinstance(parent, ast.Module) and harmless_insert(lb[head:len(lb) - tail]):
+                pass
+            elif isinstance(fn, FUNCS):
                 regions.append(("fn",) + _span(fn))
             elif fn is not None:
                 report(parent, fn, stmt)
@@ -388,13 +487,21 @@ def diff_trees(old, new, old_ranges, new_ranges):
             return
         if isinstance(a, ast.stmt):
             stmt = a
+        if fn is None and isinstance(a, (ast.Assign, ast.AnnAssign)):
+            mine = a.targets if isinstance(a, ast.Assign) else [a.target]
+            theirs = b.targets if isinstance(b, ast.Assign) else [b.target]
+            if _dump(mine) != _dump(theirs):
+                # Another name is bound now: no narrowing by statement, the whole scope changed.
+                regions.append(("imp", 1, 10**9))
+                return
         if isinstance(a, FUNCS):
             if a.name != b.name or _dump(a.decorator_list) != _dump(b.decorator_list):
                 report(a, fn, a)
                 return
+            # With `from __future__ import annotations` annotations are never evaluated.
             if (
-                _dump(a.args) != _dump(b.args)
-                or _dump(a.returns) != _dump(b.returns)
+                _signature(a.args, not lazy) != _signature(b.args, not lazy)
+                or (not lazy and _dump(a.returns) != _dump(b.returns))
                 or _dump(getattr(a, "type_params", [])) != _dump(getattr(b, "type_params", []))
             ):
                 regions.append(("fn",) + _span(a))
@@ -453,7 +560,8 @@ def select_python(index, name, change):
     except (SyntaxError, ValueError) as exc:
         log("   new source does not parse:", exc)
         return index.touchers(name)
-    regions = diff_trees(index.tree(name), new_tree, old_ranges, new_ranges)
+    unused = (lambda word: not index.identifier_used(word)) if name.startswith("sqlglot/") else None
+    regions = diff_trees(index.tree(name), new_tree, old_ranges, new_ranges, unused)
     mask = index.openers(name)  # tests that read this source as text see any edit
     for kind, lo, hi, *site in regions:
         if kind == "fn":
@@ -483,17 +591,30 @@ def select_file(index, change):
         log("   binary change")
     for name in {old, new} - {None}:
         base = name.rsplit("/", 1)[-1]
-        if base in GLOBAL_FILES and "/" not in name.replace("tests/", "", 1):
+        if base in GLOBAL_FILES:
             raise Everything("suite configuration file " + name)
+        if base in CONFIG_FILES and "/" not in name:
+            added = [text for _, _, body in change["hunks"] for tag, text, _ in body if tag == "+"]
+            if change["opaque"] or not change["hunks"] or any("pytest" in text.lower() for text in added):
+                raise Everything("possible pytest configuration in " + name)
     if old is None:  # created file
         if new is None:
             raise Everything("patch without paths")
         if new in index.files:
             raise Everything("creates a file that exists in the base: " + new)
+        directory, _, base = new.rpartition("/")
         if new.endswith(".py") and new.startswith(("sqlglot/", "tests/")):
-            raise Everything("new Python file " + new)
-        if new.startswith("tests/"):
-            return index.dir_openers(new)
+            # A new module runs only if something imports it by name or walks its directory.
+            stem = base[:-3]
+            if base == "__init__.py" or index.identifier_used(stem):
+                raise Everything("new Python file whose name is mentioned in the code: " + new)
+            listers = index.listers(directory)
+            if listers is None:
+                raise Everything("new Python file " + new)
+            return listers
+        if new.startswith(("sqlglot/", "tests/")):
+            listers = index.listers(directory)
+            return index.dir_openers(new) if listers is None else listers
         return 0
     if old not in index.files:
         raise Everything("unknown base file " + old)

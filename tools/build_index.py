@@ -30,7 +30,8 @@ root = os.path.realpath(root)
 tests = json.load(open(tests_json))["tests"]
 ids = [t["id"] for t in tests]
 
-importers, implines, fn, opens, used = {}, {}, {}, {}, {}
+importers, implines, fn, opens, used, lists = {}, {}, {}, {}, {}, {}
+have_lists = set()
 bad = []
 for bit, test, raw_dir in [(b, t, r) for b, t in enumerate(tests) for r in raw.split(",")]:
     rec = json.load(open(os.path.join(raw_dir, f"{test['number']}.json")))
@@ -47,6 +48,10 @@ for bit, test, raw_dir in [(b, t, r) for b, t in enumerate(tests) for r in raw.s
             per[line] = per.get(line, 0) | mask
     for name in rec["opens"]:
         opens[name] = opens.get(name, 0) | mask
+    if "lists" in rec:
+        have_lists.add(bit)
+        for name in rec["lists"]:
+            lists[name] = lists.get(name, 0) | mask
     for key in rec.get("classes", ()):
         used[key] = used.get(key, 0) | mask
 
@@ -56,6 +61,78 @@ if bad:
 base_files = subprocess.run(["git", "-C", root, "ls-files"], capture_output=True, text=True, check=True).stdout.split("\n")
 base_files = [f for f in base_files if f]
 
+
+
+PY_FILES = [f for f in base_files if f.endswith(".py") and f.startswith(("sqlglot/", "tests/"))]
+TREES = {name: ast.parse(open(os.path.join(root, name), encoding="utf-8").read()) for name in PY_FILES}
+NAMED = {}        # identifier -> tests that ran a function line mentioning it
+IMPORT_REFS = {}  # identifier -> number of mentions outside function bodies (run at import)
+ALIASED = set()   # names imported under another name somewhere
+_FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _scan(node, name, inside):
+    ident = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
+    if ident is not None:
+        if inside:
+            lines = fn.get(name, {})
+            mask = 0
+            for line in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+                mask |= lines.get(line, 0)
+            if mask:
+                NAMED[ident] = NAMED.get(ident, 0) | mask
+        elif not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)):
+            IMPORT_REFS[ident] = IMPORT_REFS.get(ident, 0) + 1
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        for alias in node.names:
+            if alias.asname and alias.asname != alias.name:
+                ALIASED.add(alias.name)
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        for ident in node.names:
+            IMPORT_REFS[ident] = IMPORT_REFS.get(ident, 0) + 1
+    for field, value in ast.iter_fields(node):
+        deeper = inside or (isinstance(node, _FUNCS) and field == "body")
+        for child in value if isinstance(value, list) else [value]:
+            if isinstance(child, ast.AST):
+                _scan(child, name, deeper)
+
+
+for _name, _tree in TREES.items():
+    _scan(_tree, _name, False)
+ALL_TEXT = "\n".join(open(os.path.join(root, name), encoding="utf-8").read() for name in PY_FILES)
+
+
+def constant_users():
+    """Per sqlglot file: {"first-last": mask} for module-level `NAME = value` statements
+    whose value can only reach a test through a function line that mentions NAME:
+    NAME is never mentioned in import-time code, never imported under another name,
+    never appears inside a string (getattr), and is bound exactly once in its module."""
+    import re
+    out = {}
+    for name, tree in TREES.items():
+        if not name.startswith("sqlglot/"):
+            continue
+        bound = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                bound[node.id] = bound.get(node.id, 0) + 1
+        for node in tree.body:
+            target = None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                target = node.targets[0].id
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+                target = node.target.id
+            if target is None or target.startswith("__") or target in ALIASED or bound.get(target, 0) != 1:
+                continue
+            if IMPORT_REFS.get(target, 0):
+                continue
+            if re.search(r"""["']%s["']""" % re.escape(target), ALL_TEXT):
+                continue
+            out.setdefault(name, {})["%d-%d" % (node.lineno, node.end_lineno)] = format(NAMED.get(target, 0), "x")
+    return out
+
+
+constants = constant_users()
 
 
 def class_users():
@@ -69,29 +146,7 @@ def class_users():
     if not class_info:
         return {}
     observable = set(json.load(open(class_info)))
-    py = [f for f in base_files if f.endswith(".py") and f.startswith(("sqlglot/", "tests/"))]
-    trees = {name: ast.parse(open(os.path.join(root, name), encoding="utf-8").read()) for name in py}
-    named = {}  # identifier -> tests that ran a function line mentioning it
-    funcs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-
-    def scan(node, name, inside):
-        if inside:
-            ident = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
-            if ident is not None:
-                lines = fn.get(name, {})
-                mask = 0
-                for line in range(node.lineno, (node.end_lineno or node.lineno) + 1):
-                    mask |= lines.get(line, 0)
-                if mask:
-                    named[ident] = named.get(ident, 0) | mask
-        for field, value in ast.iter_fields(node):
-            deeper = inside or (isinstance(node, funcs) and field == "body")
-            for child in value if isinstance(value, list) else [value]:
-                if isinstance(child, ast.AST):
-                    scan(child, name, deeper)
-
-    for name, tree in trees.items():
-        scan(tree, name, False)
+    trees, named = TREES, NAMED
     out = {}
     for name, tree in trees.items():
         if not name.startswith("sqlglot/"):
@@ -155,6 +210,10 @@ with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         "untraced": sorted({i for i, _ in bad}),
         "opens": {name: format(mask, "x") for name, mask in sorted(opens.items())},
         "files": base_files,
+        # directories each test enumerated itself; tests without that record count for every directory
+        "lists": ({name: format(mask | sum(1 << b for b in range(len(tests)) if b not in have_lists), "x")
+                   for name, mask in sorted(lists.items())} if have_lists else None),
+        "no_lists": format(sum(1 << b for b in range(len(tests)) if b not in have_lists), "x"),
         "cov": sorted(set(importers) | set(fn)),
     }, separators=(",", ":")))
     for name in sorted(set(importers) | set(fn)):
@@ -171,6 +230,7 @@ with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
             "lines": lines,
             "classes": classes.get(name, []),
             "cmp": comparisons.get(name, {}),
+            "consts": constants.get(name, {}),
         }, separators=(",", ":")))
     for name in base_files:
         if name.endswith(".py") and (name.startswith("sqlglot/") or name.startswith("tests/")):
