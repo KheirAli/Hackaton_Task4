@@ -34,7 +34,7 @@ DATA = Path(os.environ.get("BLAST_DATA", "/data"))
 INDEX = Path(os.environ.get("BLAST_INDEX", Path(__file__).resolve().parent / "blast_index.zip"))
 DEBUG = os.environ.get("BLAST_DEBUG") == "1"
 CLASS_NARROWING = os.environ.get("BLAST_CLASS_NARROWING", "1") == "1"
-CONST_NARROWING = os.environ.get("BLAST_CONST_NARROWING", "0") == "1"
+CONST_NARROWING = os.environ.get("BLAST_CONST_NARROWING", "1") == "1"
 CMP_PROFILE = os.environ.get("BLAST_CMP_PROFILE", "1") == "1"
 # Operator swaps whose outcome on given operands is stable from run to run: identity
 # against equality, and a strict bound against its inclusive form (they differ only
@@ -168,6 +168,16 @@ class Index:
                     mask |= line_mask
         return mask
 
+    def literal_users(self, name, lo, hi):
+        """`NAME = literal` became `NAME = other literal`, at module or class level. If NAME is
+        only ever read inside functions, the new value reaches a test only through a function
+        line that mentions NAME. None when the index cannot say that for this statement."""
+        entry = self.cov(name)
+        users = entry["consts"].get("%d-%d" % (lo, hi)) if CONST_NARROWING else None
+        if users is None:
+            return None
+        return int(users, 16) & entry["importers"]
+
     def imp_range(self, name, lo, hi):
         """Tests affected by a change to import-time code on lines lo..hi.
 
@@ -181,11 +191,6 @@ class Index:
         if not any(lo <= line <= hi for line in entry["implines"]):
             return 0
         importers = entry["importers"]
-        users = entry["consts"].get("%d-%d" % (lo, hi)) if CONST_NARROWING else None
-        if users is not None:
-            # `NAME = value` at module level, with NAME only ever mentioned inside
-            # functions: the new value reaches a test only through such a line.
-            return int(users, 16) & importers
         if CLASS_NARROWING and bin(importers).count("1") >= EAGER_SHARE * len(self.tests):
             for c_lo, c_hi, users in entry["classes"]:
                 if c_lo < lo and hi <= c_hi and (lo, hi) != (c_lo, c_hi):
@@ -494,6 +499,11 @@ def diff_trees(old, new, old_ranges, new_ranges, unused_name=None):
                 # Another name is bound now: no narrowing by statement, the whole scope changed.
                 regions.append(("imp", 1, 10**9))
                 return
+            if a.value is not None and b.value is not None and _literal(a.value) and _literal(b.value):
+                # Evaluating either value cannot fail or do anything: only readers of the name matter.
+                if _dump(a.value) != _dump(b.value):
+                    regions.append(("lit",) + _span(a))
+                return
         if isinstance(a, FUNCS):
             if a.name != b.name or _dump(a.decorator_list) != _dump(b.decorator_list):
                 report(a, fn, a)
@@ -566,6 +576,10 @@ def select_python(index, name, change):
     for kind, lo, hi, *site in regions:
         if kind == "fn":
             part = index.fn_range(name, lo, hi)
+        elif kind == "lit":
+            part = index.literal_users(name, lo, hi)
+            if part is None:
+                part = index.imp_range(name, lo, hi) | index.fn_range(name, lo, hi)
         elif kind == "cmp":
             part = index.fn_range(name, lo, hi)
             profile = index.cov(name)["cmp"].get(site[0]) if CMP_PROFILE and site[1:] and site[2] else None
