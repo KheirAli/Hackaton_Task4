@@ -57,15 +57,16 @@ ENV PYTHONHASHSEED=0 \
     MIMALLOC_LARGE_OS_PAGES=1 \
     MIMALLOC_RESERVE_OS_MEMORY=256MiB \
     MIMALLOC_ARENA_EAGER_COMMIT=1 \
-    MIMALLOC_PURGE_DELAY=-1 \
-    BR_NO_FIXTURE_BATCH=1
+    MIMALLOC_PURGE_DELAY=-1
 
 # 4. our program and maps (last, so that a code change rebuilds only this). The TestExecutor row
 #    cache (preload.py) is built from the pinned csv files and checked against the real
 #    setUpClass; if the check fails, the cache is removed and the selector runs setUpClass as before.
 #    DuckDB's answers to the SQL texts of the pinned tests are recorded too (build_duck_replay.py,
 #    duckreplay.py): a test that sends a recorded text gets the recorded answer, any other text
-#    runs in DuckDB. If the recording or its rehearsal fails, every query runs as before.
+#    runs in DuckDB. The recording is a committed file (app/prebuilt/duck_replay.bin, made by the
+#    same script on the pinned tree, byte-identical across builds): recording it here takes too
+#    long on a slow build machine, so the build only rehearses it. If that fails, every query runs.
 #    Two more facts of the pinned tree are prepared here: whether any test file reads docstrings
 #    (build_docs_read.py; the selector otherwise reads all test files to find out), and the map
 #    files are stored without zlib compression (rawmaps.py; rawz.py reads both forms, and every
@@ -78,7 +79,7 @@ RUN (cd /repo && SKIP_INTEGRATION=0 timeout 150 python /app/build_memo.py /repo 
 RUN (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
      || (echo "exec cache check failed; running without it" >&2; rm -rf /app/cache)) \
     && mkdir -p /app/cache \
-    && (timeout 240 python /app/build_duck_replay.py /repo /app/cache/duck_replay.bin --check \
+    && (timeout 200 python /app/build_duck_replay.py /repo /app/cache/duck_replay.bin --from /app/prebuilt/duck_replay.bin --check \
      || (echo "no DuckDB answer recording; every query runs" >&2; rm -f /app/cache/duck_replay.bin)) \
     && (python /app/build_base_state.py /repo /app/cache/base_state.bin \
      || (echo "no saved base state; the selector computes it" >&2; rm -f /app/cache/base_state.bin)) \
