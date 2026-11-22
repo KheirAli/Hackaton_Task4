@@ -5,8 +5,9 @@ that an SQL template parsed at class-definition time omits, an invalid regex at 
 a helper that now raises while a dialect loads. Then every test of the affected test files
 fails, including tests that never run the changed line, so line coverage alone under-selects.
 
-For each patch that touches code which runs at import time, a forked child imports the whole
-patched package (about 0.2 s of CPU). For every module that no longer imports, all tests
+main.py runs first. Then, for each patch for which it selected many tests and which touches
+code that runs at import time, a forked child imports the whole patched package (about 0.2 s
+of CPU). For every module that no longer imports, all tests
 that imported it on the pinned commit are added (guard/blast_index.zip, a map of the pinned
 commit), together with the full static selection of guard/evidence.py for that patch. Changed
 test files are imported too; if one fails, all its tests are added.
@@ -23,7 +24,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("BR_ROOT", "/repo")
 DATA = os.environ.get("BR_DATA", "/data")
 GUARD_WALL_S = float(os.environ.get("BR_GUARD_WALL", "30"))   # total wall budget for all probes
-PROBE_TIMEOUT_S = float(os.environ.get("BR_GUARD_PROBE_TIMEOUT", "15"))
+PROBE_TIMEOUT_S = float(os.environ.get("BR_GUARD_PROBE_TIMEOUT", "10"))
+MIN_SELECTED = int(os.environ.get("BR_GUARD_MIN_SELECTED", "30"))  # probe only commits with this many selected tests
+BATCH_WALL_S = float(os.environ.get("BR_GUARD_BATCH_WALL", "165"))  # never probe past this point of the batch
 
 
 def log(*parts):
@@ -113,8 +116,9 @@ def probe(patched, modules):
     return json.loads(data.decode())
 
 
-def guard_sets():
-    """commit id -> set of test numbers that must be selected because imports break."""
+def guard_sets(only, deadline):
+    """commit id -> set of test numbers that must be selected because imports break.
+    only: the commits worth probing; deadline: wall-clock time by which all probes must end."""
     sys.path.insert(0, os.path.join(HERE, "guard"))
     import ast
     import evidence
@@ -152,6 +156,8 @@ def guard_sets():
         if not entry.endswith(".patch"):
             continue
         commit = entry[:-6]
+        if commit not in only:
+            continue
         try:
             text = open(os.path.join(commits_dir, entry), encoding="utf-8", errors="surrogateescape").read()
             patched, extra, need, broken = {}, [], False, set()
@@ -181,7 +187,7 @@ def guard_sets():
                     if any(kind in ("imp", "lit") for kind, *_ in regions) and name in by_file:
                         extra.append(module)
                         need = True
-            if not need or time.time() - started > GUARD_WALL_S:
+            if not need or time.time() - started > GUARD_WALL_S or time.time() + PROBE_TIMEOUT_S > deadline:
                 continue
             try:
                 failed = probe(patched, modules + extra)
@@ -211,28 +217,30 @@ def guard_sets():
 
 
 def main():
-    try:
-        extra, ms, schedule = guard_sets()
-    except Exception as exc:  # noqa: BLE001
-        log("unavailable", repr(exc)[:200])
-        extra = {}
+    started = time.time()
     proc = subprocess.run([sys.executable, os.path.join(HERE, "main.py")], stdout=subprocess.PIPE)
     out = proc.stdout
-    if extra and proc.returncode == 0:
+    if proc.returncode == 0 and os.environ.get("BR_NO_IMPORT_GUARD") != "1":
         try:
-            lines = []
-            for line in out.decode("utf-8").splitlines():
-                row = json.loads(line)
-                add = extra.get(row["commit"])
-                if add:
-                    have = {n for worker in row["workers"] for n in worker}
-                    if not add <= have:
-                        row["workers"] = schedule([(n, ms[n]) for n in sorted(have | add)])
-                        line = json.dumps(row, separators=(",", ":"))
-                lines.append(line)
-            out = ("\n".join(lines) + "\n").encode("utf-8")
+            rows = [json.loads(line) for line in out.decode("utf-8").splitlines()]
+            # A broken import fails every test of whole test files: hundreds of tests. The
+            # selector then already selects many of them, so only such commits are probed and
+            # an ordinary batch pays nothing for the guard.
+            suspects = {row["commit"] for row in rows if sum(len(w) for w in row["workers"]) >= MIN_SELECTED}
+            if suspects:
+                extra, ms, schedule = guard_sets(suspects, started + BATCH_WALL_S)
+                if extra:
+                    lines = []
+                    for row in rows:
+                        add = extra.get(row["commit"])
+                        if add:
+                            have = {n for worker in row["workers"] for n in worker}
+                            if not add <= have:
+                                row["workers"] = schedule([(n, ms[n]) for n in sorted(have | add)])
+                        lines.append(json.dumps(row, separators=(",", ":")))
+                    out = ("\n".join(lines) + "\n").encode("utf-8")
         except Exception as exc:  # noqa: BLE001
-            log("merge failed", repr(exc)[:200])
+            log("skipped", repr(exc)[:200])
             out = proc.stdout
     sys.stdout.buffer.write(out)
     sys.stdout.flush()
